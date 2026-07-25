@@ -3,6 +3,12 @@
 
 AI Based recruitment Platform untuk otomatisasi recruitment, parsing CV, dan *screening* otomatis yang berjalan **100% lokal** di PC Anda! Tidak ada kebocoran data pelamar, tidak ada biaya API dolar bulanan. Cukup pasang, dan biarkan sistem Agen AI mengelola alur Recruitment Anda secara mandiri 💼✨
 
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11-blue?logo=python" />
+  <img src="https://img.shields.io/github/license/drr3d/rekrutyuk" />
+  <img src="https://img.shields.io/github/last-commit/drr3d/rekrutyuk" />
+</p>
+
 ---
 
 ### 🧠 The Tech Stack Inside
@@ -31,3 +37,7 @@ Aplikasi **RekrutYuk** ini bukan sekadar aplikasi CRUD biasa atau chatbot pasif,
 *   **Anti-Amnesia Persistent Memory:** Ditenagai oleh `SqliteSaver`, yang membuat agen AI ini punya memori jangka panjang. Biarpun aplikasi di-restart atau komputer mati, Agen tetap ingat siapa kandidat terakhir yang sedang dibahas dan apa tugas terpendingnya.
 
 ---
+
+## Disclaimer
+
+This repository is an early public snapshot of the project. The production version is under active development and may differ significantly as new real-world requirements and features are continuously implemented.

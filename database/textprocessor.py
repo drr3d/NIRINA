@@ -10,7 +10,7 @@ from pathlib import Path
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
+# KEMBALI KE OLLAMA EMBEDDINGS (Tanpa HuggingFace Transformers)
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -30,7 +30,9 @@ from core_agent.config import db_path, config_path, sqlite_db_path
 # [OPTIMASI 1, 2, & 4]: MATRYOSHKA EMBEDDINGS DITARUH DI HULU (SINI)
 # =====================================================================
 class OptimizedCPUEmbeddings(HuggingFaceEmbeddings):
-    target_dimensions: int = 256 # Pangkas dimensi agar enteng di RAM/CPU
+    # Pangkas dimensi agar enteng di RAM/CPU
+    # default bisa di 1024, tapi ya nanti resource komputasi naik
+    target_dimensions: int = 256 
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         prefixed_texts = [f"search_document: {t}" for t in texts]
@@ -357,6 +359,52 @@ def update_database_catalog(filename: str, text_cv: str, model_name: str, recrea
     except Exception as e:
         print(f"-> [AI Extractor] Gagal mengekstrak/menyimpan profil ke database: {e}")
 
+# --- 3. FUNGSI UTAMA PEMROSESAN ---
+def save_chunks_to_fts5(filename: str, chunks: list, db_path: str) -> bool:
+    """
+    Fungsi modular untuk menyimpan potongan dokumen (chunks) ke SQLite FTS5 
+    guna mendukung pencarian BM25/Exact Match secara mandiri tanpa file pickle.
+    """
+    try:
+        with sqlite3.connect(db_path, timeout=30.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            
+            # Buat tabel virtual FTS5
+            cursor.execute('''
+                CREATE VIRTUAL TABLE IF NOT EXISTS cv_fts USING fts5(
+                    doc_id UNINDEXED,
+                    source UNINDEXED,
+                    content,
+                    metadata UNINDEXED
+                );
+            ''')
+            
+            # Hapus data lama agar saat update CV tidak terjadi duplikasi
+            cursor.execute("DELETE FROM cv_fts WHERE source = ?", (filename,))
+            
+            # Siapkan batch data
+            data_to_insert = []
+            for i, chunk in enumerate(chunks):
+                doc_id = f"{filename}_{i}"
+                content = chunk.page_content
+                metadata_str = json.dumps(chunk.metadata)
+                data_to_insert.append((doc_id, filename, content, metadata_str))
+            
+            # Eksekusi massal (jauh lebih cepat daripada loop execute satu-satu)
+            cursor.executemany(
+                "INSERT INTO cv_fts (doc_id, source, content, metadata) VALUES (?, ?, ?, ?)",
+                data_to_insert
+            )
+            
+            conn.commit()
+            print(f"-> [SQLite FTS5] Berhasil memperbarui indeks keyword untuk {filename}!")
+            return True
+            
+    except Exception as e:
+        print(f"-> [Warning] Gagal memproses SQLite FTS5: {e}")
+        return False
+
 def process_cv(file_path):
     # Mengambil nama file dari path lengkap (contoh: dari "C:/folder/user.pdf" jadi "user.pdf")
     filename = os.path.basename(file_path)
@@ -389,7 +437,7 @@ def process_cv(file_path):
         # Jika PDF rusak atau korup, hentikan proses di sini
         print(f"❌ [ERROR] Gagal membaca PDF {filename}: {e}")
         return
-    
+
     # =====================================================================
     # FASE 2: MEMPERSIAPKAN OTAK AI UNTUK EKSTRAKSI JSON
     # =====================================================================
@@ -430,7 +478,13 @@ def process_cv(file_path):
     # =====================================================================
     # Memotong-motong dokumen penuh menjadi bagian-bagian kecil (chunk) sebesar 1000 karakter.
     # Ada 'overlap' 200 karakter agar kalimat yang terpotong di ujung tidak kehilangan konteks.
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000, 
+        chunk_overlap=200,
+        # Sistem akan mencoba memotong dari separator paling kiri dulu. 
+        # Jika muat, dia potong antar paragraf. Jika tidak, antar baris, lalu bullet point, baru spasi.
+        separators=["\n\n", "\n", "•", "-", " ", ""] 
+    )
     chunks = text_splitter.split_documents(documents)
     
     ids = []
@@ -438,6 +492,11 @@ def process_cv(file_path):
         # Memberikan identitas (metadata) pada setiap potongan teks agar tahu teks ini asalnya dari CV siapa
         chunk.metadata["source"] = filename
         chunk.metadata["type"] = "resume"
+
+        # 2. [UPGRADE RAG]: Injeksi Konteks ke dalam teks langsung!
+        # Kita paksa AI tahu potongan teks ini asalnya dari file/kandidat mana
+        chunk.page_content = f"[Sumber CV: {filename}]\n" + chunk.page_content
+
         # Membuat ID unik (contoh: "user.pdf_0", "user.pdf_1")
         ids.append(f"{filename}_{i}")
     
@@ -445,28 +504,10 @@ def process_cv(file_path):
     vector_db.add_documents(chunks, ids=ids)
     print(f"-> [ChromaDB] Berhasil menyimpan {len(chunks)} chunk teks untuk {filename}!")
     
-    # 2. Simpan potongan teks ini ke dalam Corpus BM25 (Berbasis Kata Kunci Eksak)
-    bm25_corpus_path = Path(str(db_path)) / "bm25_corpus.pkl"
-    try:
-        corpus_docs = []
-        # Jika file kumpulan kata kunci (pickle) sudah ada sebelumnya, buka dan baca dulu isinya
-        if bm25_corpus_path.exists():
-            with open(bm25_corpus_path, "rb") as f:
-                corpus_docs = pickle.load(f)
-                
-        # Hapus potongan teks lama milik pelamar ini (jika ada) supaya data update CV tidak terhitung ganda
-        corpus_docs = [doc for doc in corpus_docs if doc.metadata.get("source") != filename]
-        
-        # Tambahkan potongan teks (chunk) dari CV yang baru diproses ini ke dalam tumpukan corpus
-        corpus_docs.extend(chunks)
-        
-        # Simpan/tutup kembali file pickle-nya
-        with open(bm25_corpus_path, "wb") as f:
-            pickle.dump(corpus_docs, f)
-        print(f"-> [BM25 Corpus] Berhasil memperbarui keyword indeks untuk Hybrid Search!")
-        
-    except Exception as e:
-        print(f"-> [Warning] Gagal memproses BM25 Corpus: {e}")
+    # ---------------------------------------------------------------------
+    # 2. [UPGRADE] Simpan potongan teks ini ke dalam SQLite FTS5 (Berbasis Kata Kunci Eksak)
+    # ---------------------------------------------------------------------
+    save_chunks_to_fts5(filename, chunks, str(sqlite_db_path))
 
     print("=== Selesai ===\n")
     return True

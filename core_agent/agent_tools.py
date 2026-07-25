@@ -1,20 +1,35 @@
-import pickle
+import json, sqlite3, re
 import numpy as np
-from pathlib import Path
+
+from typing import List
 
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from langchain_core.documents import Document
+from pydantic import Field
+
+# --- IMPORT BARU UNTUK RERANKER ---
+from langchain_classic.retrievers import ContextualCompressionRetriever
+from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+
+# --- IMPORT RERANKER ---
+from langchain_classic.retrievers import ContextualCompressionRetriever
+from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 
 # --- TAMBAHKAN IMPORT INI ---
-from .config import db_path
+from .config import db_path, sqlite_db_path
 
 # =====================================================================
 # WAJIB IDENTIK DENGAN TEXTPROCESSOR AGAR DIMENSI VEKTOR COCOK (256)
 # =====================================================================
 class OptimizedCPUEmbeddings(HuggingFaceEmbeddings):
+    # set 256 biar lebih ringan, boleh dinaikkan sampai 1024 jika spek mencukupi
     target_dimensions: int = 256
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -57,28 +72,73 @@ elif embeddings_method == 2:
     )
 
 # =====================================================================
-# [HYBRID RETRIEVER EXPORT] Gantikan `retriever` lama Anda dengan ini
+# CUSTOM RETRIEVER: SQLITE FTS5 (Pengganti Pickle BM25)
 # =====================================================================
-def get_hybrid_retriever(top_k: int = 10):
-    chroma_retriever = vector_db.as_retriever(search_kwargs={"k": top_k})
-    
-    bm25_corpus_path = Path(str(db_path)) / "bm25_corpus.pkl"
-    bm25_retriever = None
-    
-    if bm25_corpus_path.exists():
-        try:
-            with open(bm25_corpus_path, "rb") as f:
-                corpus_docs = pickle.load(f)
-            if corpus_docs:
-                bm25_retriever = BM25Retriever.from_documents(corpus_docs)
-                bm25_retriever.k = top_k
-        except Exception as e:
-            print(f"[Warning] Gagal meload BM25: {e}")
+class SQLiteFTS5Retriever(BaseRetriever):
+    """Retriever kustom LangChain untuk menarik data menggunakan algoritma BM25 dari SQLite FTS5."""
+    db_path: str = Field(description="Path ke file database SQLite")
+    k: int = Field(default=10, description="Jumlah dokumen yang akan ditarik")
 
-    # Gabungkan Makna (Vector) dan Kata Kunci (BM25)
-    if bm25_retriever:
-        return EnsembleRetriever(
-            retrievers=[chroma_retriever, bm25_retriever],
-            weights=[0.5, 0.5]
-        )
-    return chroma_retriever
+    def _sanitize_fts5_query(self, text: str) -> str:
+        """
+        Pembersihan teks (Sanitization):
+        Mencegah error 'fts5: syntax error' jika AI menggunakan karakter spesial seperti tanda kutip, minus, atau bintang.
+        """
+        clean_text = re.sub(r'[^\w\s]', ' ', text)
+        words = [w.strip() for w in clean_text.split() if w.strip()]
+        if not words:
+            return ""
+        # Format pencarian OR untuk memperluas jangkauan recall BM25
+        return " OR ".join([f'"{w}"' for w in words])
+
+    def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> List[Document]:
+        docs = []
+        safe_query = self._sanitize_fts5_query(query)
+        
+        if not safe_query:
+            return docs
+
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                cursor = conn.cursor()
+                # Mencari kecocokan eksak pada kolom 'content' dan diurutkan berdasarkan skor relevansi BM25 (rank)
+                cursor.execute(
+                    "SELECT content, metadata FROM cv_fts WHERE cv_fts MATCH ? ORDER BY rank LIMIT ?",
+                    (safe_query, self.k)
+                )
+                for row in cursor.fetchall():
+                    content = row[0]
+                    metadata = json.loads(row[1]) if row[1] else {}
+                    docs.append(Document(page_content=content, metadata=metadata))
+        except Exception as e:
+            print(f"[FTS5 Retriever Error]: {e}")
+            
+        return docs
+
+# =====================================================================
+# HYBRID RETRIEVER (Vector + FTS5 + Reranker)
+# =====================================================================
+def get_hybrid_retriever(top_k_awal: int = 10, top_k_final: int = 3):
+    # 1. Base Retrievers: Makna dari ChromaDB
+    chroma_retriever = vector_db.as_retriever(search_kwargs={"k": top_k_awal})
+    
+    # 2. Base Retrievers: Kata Kunci Eksak dari SQLite FTS5
+    fts5_retriever = SQLiteFTS5Retriever(db_path=str(sqlite_db_path), k=top_k_awal)
+
+    # Gabungkan keduanya dengan LangChain Ensemble (Bobot 50:50)
+    base_retriever = EnsembleRetriever(
+        retrievers=[chroma_retriever, fts5_retriever],
+        weights=[0.5, 0.5]
+    )
+
+    # 3. Reranker (Menyaring dan mengurutkan ulang hasil Base Retriever agar presisi)
+    model_reranker = HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-base")
+    compressor = CrossEncoderReranker(model=model_reranker, top_n=top_k_final)
+
+    # 4. Finalisasi Retriever
+    compression_retriever = ContextualCompressionRetriever(
+        base_compressor=compressor,
+        base_retriever=base_retriever
+    )
+    
+    return compression_retriever
