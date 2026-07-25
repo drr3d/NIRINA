@@ -5,6 +5,8 @@ AI Based recruitment Platform untuk otomatisasi recruitment, parsing CV, dan *sc
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11-blue?logo=python" />
+  <img src="https://img.shields.io/badge/LangGraph-Agentic_AI-00A67E" />
+  <img src="https://img.shields.io/badge/LangChain-Framework-1C3C3C" />
   <img src="https://img.shields.io/github/license/drr3d/rekrutyuk" />
   <img src="https://img.shields.io/github/last-commit/drr3d/rekrutyuk" />
 </p>

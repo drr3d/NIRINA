@@ -10,7 +10,7 @@ from langchain_ollama import ChatOllama
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-# Import dari file Anda yang lain
+# Import dari file yang lain
 from .systemprompt_collection import system_prompt
 from .config import config_path, app_dir
 from .registry import ToolRegistry
@@ -35,7 +35,7 @@ def optimasi_konteks_langchain(messages):
             cleaned_messages.append(msg)
             continue
             
-        # 2. Cek apakah ini pesan dari obrolan masa lalu
+        # 2. Cek apakah ini pesan dari obrolan yg lalu
         is_pesan_lama = (total_msgs - idx) > BATAS_PESAN_AKTIF
         
         if msg.type == "tool":
@@ -76,7 +76,6 @@ class AgentState(TypedDict):
 class AIBrainProcessor:
     """
     Komponen Otak Utama (Brain Node) untuk AI Agent.
-    Dibuat dengan struktur OOP minimalis tanpa parameter inisialisasi yang rumit.
     """
     
     def __init__(self, llm_model: Any, tools_list: list, base_prompt: str):
@@ -142,12 +141,12 @@ class AIBrainProcessor:
         # 4. Siapkan state balasan
         update_state = {"messages": [response]}
         
-        # 5. Intersep teks untuk simpan status tugas
+        # 5. simpan status task
         if response.content:
             update_state["pending_tasks"] = self._extract_pending_tasks(response.content)
         else:
-            # Jika respon hanya memanggil tool tanpa teks, biarkan tugas pending sebelumnya (jangan ditimpa string kosong)
-            # Kecuali jika Anda ingin meresetnya. Untuk amannya, kita abaikan update jika tidak ada text.
+            # Jika respon hanya memanggil tool tanpa teks, biarkan task pending sebelumnya (jangan ditimpa string kosong)
+            # Kecuali jika ingin meresetnya. Untuk amannya, kita abaikan update jika tidak ada text.
             pass
 
         return update_state
