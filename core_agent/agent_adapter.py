@@ -96,29 +96,35 @@ class StreamlitAgentAdapter:
         if "messages" in state.values:
             messages = state.values["messages"]
             
-            # 1. Cari index pesan Human (User) terakhir
             last_human_idx = -1
             for i in range(len(messages) - 1, -1, -1):
                 if messages[i].type == "human":
                     last_human_idx = i
                     break
             
-            # 2. Gabungkan SEMUA teks dari AI setelah pesan User terakhir
             if last_human_idx != -1:
                 kumpulan_teks_ai = []
-                for msg in messages[last_human_idx + 1:]:
-                    # Hanya ambil pesan dari AI yang memiliki isi teks
-                    if msg.type == "ai" and msg.content and msg.content.strip():
-                        # --- PERBAIKAN: FILTER "INNER MONOLOGUE" ---
-                        # Jika pesan AI ini dibarengi dengan pemanggilan tool, 
-                        # itu berarti teksnya cuma "pengantar" sebelum tool dieksekusi.
-                        # Kita abaikan agar UI tidak menampilkan teks double/gumaman AI.
-                        if not getattr(msg, "tool_calls", []):
-                            kumpulan_teks_ai.append(msg.content.strip())
+                teks_cadangan_pemikiran = [] # [BARU] Menyimpan pemikiran AI sebelum blank
                 
-                # Jika ada teks yang terkumpul, gabungkan dengan pembatas
+                for msg in messages[last_human_idx + 1:]:
+                    if msg.type == "ai" and msg.content and msg.content.strip():
+                        if not getattr(msg, "tool_calls", []):
+                            # Teks murni (Kesimpulan akhir)
+                            kumpulan_teks_ai.append(msg.content.strip())
+                        else:
+                            # Teks pengantar sebelum memanggil tool
+                            teks_cadangan_pemikiran.append(msg.content.strip())
+                
+                # [BARU] Logika Evaluasi UI
                 if kumpulan_teks_ai:
                     jawaban_final = "\n\n---\n\n".join(kumpulan_teks_ai)
+                elif teks_cadangan_pemikiran:
+                    # Jika AI blank di akhir, selamatkan UI dengan menampilkan pemikirannya
+                    jawaban_final = (
+                        "*(AI sedang menyusun data)*\n\n" + 
+                        "\n\n".join(teks_cadangan_pemikiran) + 
+                        "\n\n---\n⚠️ *Sistem: AI telah berhasil menarik data dari alat, namun tidak dapat merangkumnya. Silakan persempit kriteria pencarian Anda.*"
+                    )
 
         return {
             "status": "selesai",

@@ -3,11 +3,11 @@ from ..agent_nodes import (
     panggil_otak_llm,
     eksekutor_safe,
     eksekutor_sensitive,
-    router_keputusan
 )
 
 from ..agent_router import DecisionRouter
-from ..agent_tools import sensitive_tools
+# Instansiasi router, masukkan dependencies-nya
+from ..agent_nodes import sensitive_tools
 dynamic_router = DecisionRouter(sensitive_tools=sensitive_tools)
 
 # SKEMA GRAF DEFAULT
@@ -15,7 +15,12 @@ DEFAULT_GRAPH_CONFIG = [
     # 1. Pendaftaran Node
     {"type": "node", "name": "node_ai", "func": panggil_otak_llm},
     {"type": "node", "name": "node_safe", "func": eksekutor_safe},
-    {"type": "node", "name": "node_sensitive", "func": eksekutor_sensitive},
+    {
+        "type": "node", 
+        "name": "node_sensitive", 
+        "func": eksekutor_sensitive,
+        "interrupt_before": True  # <--- This Important!
+    },
 
     # 2. Pendaftaran Edge Langsung
     {"type": "edge", "start": START, "end": "node_ai"},

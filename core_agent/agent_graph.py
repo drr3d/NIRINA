@@ -5,15 +5,14 @@ import sqlite3
 
 from typing import Dict, Any, List, Type
 from langchain_core.messages import HumanMessage, ToolMessage
-from langgraph.graph import StateGraph, START, END
-#from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import StateGraph
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from .config import sqlite_db_path
+from .agent_adapter import StreamlitAgentAdapter
 from .agent_nodes import (
     AgentState
 )
-from .agent_tools import sqlite_db_path
-from .agent_adapter import StreamlitAgentAdapter
 
 # ==========================================
 # 2. CORE AGENT ENGINE
@@ -171,7 +170,7 @@ engine = get_agent_engine()
 
 def proses_chat_agent(user_input: str = None, thread_id: str = "hr_session_001", is_approval: bool = False, user_role: str = "Staff") -> dict:
     try:
-        # 1. Jalankan core engine (Memori kini akan abadi selama server menyala)
+        # 1. Jalankan core engine (Memori kini akan bertahan selama server menyala)
         state_terbaru = engine.run(user_input, thread_id, is_approval, user_role)
         # 2. Terjemahkan hasilnya menggunakan Adapter untuk UI Streamlit
         return StreamlitAgentAdapter.process_state_to_ui(state_terbaru)

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-# KEMBALI KE OLLAMA EMBEDDINGS (Tanpa HuggingFace Transformers)
+
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -25,13 +25,6 @@ if str(root_dir) not in sys.path:
 
 # Sesuaikan dengan path database Anda
 from core_agent.config import db_path, config_path, sqlite_db_path
-
-embeddings = OllamaEmbeddings(model="nomic-embed-text")
-
-bge = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-m3",
-    encode_kwargs={'normalize_embeddings': True}
-)
 
 # =====================================================================
 # [OPTIMASI 1, 2, & 4]: MATRYOSHKA EMBEDDINGS DITARUH DI HULU (SINI)
@@ -55,15 +48,25 @@ class OptimizedCPUEmbeddings(HuggingFaceEmbeddings):
         normalized = np.divide(arr, norms, out=np.zeros_like(arr), where=norms!=0)
         return normalized.tolist()
 
-# Gunakan Class Optimized yang baru dibuat
-bge_xmatroyshka = OptimizedCPUEmbeddings(
-    model_name="BAAI/bge-m3",
-    model_kwargs={'device': 'cpu'},
-    encode_kwargs={'normalize_embeddings': False} # Normalisasi sudah dihandle class
-)
+embeddings = None
+embeddings_method = 2
+if embeddings_method == 0:
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+elif embeddings_method == 1:
+    embeddings = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-m3",
+        encode_kwargs={'normalize_embeddings': True}
+    )
+elif embeddings_method == 2:
+    # Gunakan Class Optimized yang baru dibuat
+    embeddings = OptimizedCPUEmbeddings(
+        model_name="BAAI/bge-m3",
+        model_kwargs={'device': 'cpu'},
+        encode_kwargs={'normalize_embeddings': False} # Normalisasi sudah dihandle class
+    )
 
 vector_db = Chroma(persist_directory=str(db_path), 
-                   embedding_function=bge_xmatroyshka,
+                   embedding_function=embeddings,
                    collection_metadata={"hnsw:space": "cosine"})
 
 # --- 2. PROMPT EXTRACTION ---
@@ -149,9 +152,10 @@ def auto_screening_cv(profil_kandidat: dict, model_name: str) -> tuple[str, str]
              "- REJECT: Relevansi < 50%, ATAU tidak memenuhi kualifikasi dasar sama sekali."
             ),
             ("human", 
-             f"Posisi Lowongan: {posisi_lowongan}\n"
-             f"Keyword Wajib: {keyword_lowongan}\n\n"
-             f"Data Ekstraksi CV Kandidat:\n{json.dumps(profil_kandidat, indent=2)}"
+             # PERBAIKAN 1: Hapus f-string, gunakan placeholder standar Langchain
+             "Posisi Lowongan: {posisi}\n"
+             "Keyword Wajib: {keyword}\n\n"
+             "Data Ekstraksi CV Kandidat:\n{data_cv}"
             )
         ])
         
@@ -159,7 +163,13 @@ def auto_screening_cv(profil_kandidat: dict, model_name: str) -> tuple[str, str]
         
         # Panggil LLM dengan format JSON agar tidak melantur
         llm_screener = ChatOllama(model=model_name, temperature=0.0, format="json")
-        raw_result = (prompt_screening | llm_screener).invoke({}).content
+        
+        # PERBAIKAN 2: Injeksi data lewat invoke(), bukan langsung ditempel di string
+        raw_result = (prompt_screening | llm_screener).invoke({
+            "posisi": posisi_lowongan,
+            "keyword": keyword_lowongan,
+            "data_cv": json.dumps(profil_kandidat, indent=2)
+        }).content
         
         # Bersihkan format jika LLM menambahkan markdown ```json
         cleaned_output = re.sub(r'```json\s*|```', '', raw_result, flags=re.IGNORECASE).strip()
@@ -348,7 +358,7 @@ def update_database_catalog(filename: str, text_cv: str, model_name: str, recrea
         print(f"-> [AI Extractor] Gagal mengekstrak/menyimpan profil ke database: {e}")
 
 def process_cv(file_path):
-    # Mengambil nama file dari path lengkap (contoh: dari "C:/folder/cv_aulia.pdf" jadi "cv_aulia.pdf")
+    # Mengambil nama file dari path lengkap (contoh: dari "C:/folder/user.pdf" jadi "user.pdf")
     filename = os.path.basename(file_path)
     print(f"\n=== Memproses file: {filename} ===")
     
@@ -428,7 +438,7 @@ def process_cv(file_path):
         # Memberikan identitas (metadata) pada setiap potongan teks agar tahu teks ini asalnya dari CV siapa
         chunk.metadata["source"] = filename
         chunk.metadata["type"] = "resume"
-        # Membuat ID unik (contoh: "cv_aulia.pdf_0", "cv_aulia.pdf_1")
+        # Membuat ID unik (contoh: "user.pdf_0", "user.pdf_1")
         ids.append(f"{filename}_{i}")
     
     # 1. Simpan potongan teks ini ke dalam ChromaDB (Berbasis Makna/Vektor)
