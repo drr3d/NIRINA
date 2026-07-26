@@ -3,7 +3,34 @@
   <img src="images/logo.png" width="20%">
 </p>
 
-AI Based recruitment Platform untuk otomatisasi recruitment, parsing CV, dan *screening* otomatis yang berjalan **100% lokal** di PC Anda! Tidak ada kebocoran data pelamar, tidak ada biaya API dolar bulanan. Cukup pasang, dan biarkan sistem Agen AI mengelola alur Recruitment Anda secara mandiri 💼✨
+**RekrutYuk** bukan hanya aplikasi rekrutmen, tetapi sebuah framework **Agentic AI** untuk membangun sistem rekrutmen cerdas yang dapat disesuaikan dengan kebutuhan setiap perusahaan.
+
+Dengan dukungan **Hybrid RAG**, sistem dapat mempelajari data pelamar sekaligus dokumen internal perusahaan sehingga mampu memberikan rekomendasi yang lebih akurat dan sesuai konteks.
+
+### ✨ Fitur Utama
+
+- 📄 **Parsing CV Otomatis** (PDF, DOCX, TXT)
+- 🎯 **Screening Kandidat** berdasarkan kebutuhan recruiter
+- 💼 **Manajemen Lowongan Pekerjaan**
+- 📝 **Membuat Pertanyaan Interview** secara otomatis
+- ⚖️ **Membandingkan Kandidat** berdasarkan skill, pengalaman, maupun kriteria tertentu
+- 💬 **AI Recruitment Assistant** untuk menjawab pertanyaan recruiter menggunakan bahasa natural
+- 📚 **Hybrid RAG** yang dapat memanfaatkan:
+  - Data CV pelamar
+  - SOP rekrutmen
+  - Panduan interview
+  - Kebijakan HR
+  - Knowledge base internal perusahaan
+- 🤖 **Agentic AI Workflow** yang dapat diperluas dengan tools dan workflow sesuai kebutuhan perusahaan
+- 🔌 **Plugin System** untuk menambahkan tool atau workflow baru dengan mudah
+- 🖥️ **100% Berjalan Secara Lokal** menggunakan Ollama, tanpa bergantung pada layanan AI cloud
+
+### 🔒 Keunggulan
+
+- Data pelamar tetap berada di infrastruktur perusahaan
+- Tidak ada biaya API AI bulanan
+- Mendukung model LLM lokal yang memiliki kemampuan Tool Calling
+- Seluruh workflow dapat dikustomisasi sesuai kebutuhan
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11-blue?logo=python" />
@@ -51,12 +78,10 @@ Aplikasi **RekrutYuk** ini bukan sekadar aplikasi CRUD biasa atau chatbot pasif,
 
 ---
 
-## Getting Started
+## 🚀 Getting Started
 <p align="center">
   <img src="images/rekrutyuk_endtoend_flow.png" width="50%">
 </p>
-
-# 🚀 Getting Started
 
 Getting RekrutYuk up and running is straightforward.
 
