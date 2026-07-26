@@ -55,19 +55,38 @@ def render(temp_dir):
             
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("✅ Setujui & Lanjutkan", use_container_width=True):
+                # Perbaikan Warning Streamlit: ganti use_container_width menjadi width="stretch"
+                if st.button("✅ Setujui & Lanjutkan", width="stretch"):
                     approval_ui.empty()
                     with chat_container:
                         with st.chat_message("assistant"):
-                            with st.spinner("AI sedang mengeksekusi tindakan..."):
+                            # Teks spinner disesuaikan karena AI mungkin berpikir lebih lama
+                            with st.spinner("AI sedang mengeksekusi tindakan (otomatis meneruskan jika berantai)..."):
+                                
+                                # 1. Eksekusi pertama setelah tombol ditekan
                                 hasil = proses_chat_agent(
                                             is_approval=True, 
-                                            thread_id=st.session_state.active_thread_id,  # <--- TAMBAHKAN INI
+                                            thread_id=st.session_state.active_thread_id,
                                             user_role=st.session_state.user_role
                                         )
+                                
+                                # ==========================================
+                                # 2. [AUTO-APPROVE LOOP]: Bypass persetujuan berantai
+                                # ==========================================
+                                # Selama AI masih meminta persetujuan di task yang sama,
+                                # sistem akan otomatis mem-bypass dan menekan "Gas Terus" untuk AI.
+                                while hasil.get("status") == "butuh_persetujuan":
+                                    hasil = proses_chat_agent(
+                                                is_approval=True, 
+                                                thread_id=st.session_state.active_thread_id,
+                                                user_role=st.session_state.user_role
+                                            )
+                                
+                                # ==========================================
+                                # 3. Selesai Loop = Mendapat Jawaban Final
+                                # ==========================================
                                 st.markdown(hasil["pesan"])
                                 
-                                # [UPDATE]: Simpan pesan beserta identitas user
                                 save_chat_message(
                                     "assistant", 
                                     hasil["pesan"], 
@@ -80,12 +99,14 @@ def render(temp_dir):
                                     "content": hasil["pesan"],
                                     "download_file": hasil.get("download_info")
                                 })
-                    st.session_state.menunggu_approval = False
-                    st.session_state.data_approval = None
-                    st.rerun()
+                                
+                                # Bersihkan status persetujuan
+                                st.session_state.menunggu_approval = False
+                                st.session_state.data_approval = None
+                                st.rerun()
                 
             with col2:
-                if st.button("❌ Batalkan", use_container_width=True):
+                if st.button("❌ Batalkan", width="stretch"):
                     st.session_state.menunggu_approval = False
                     st.session_state.data_approval = None
                     st.rerun()

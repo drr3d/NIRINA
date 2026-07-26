@@ -31,7 +31,7 @@ def render(sqlite_db_path):
                     "id": st.column_config.NumberColumn("ID", disabled=True), 
                     "file_cv": st.column_config.TextColumn("File CV", disabled=True), 
                     "gender": st.column_config.SelectboxColumn(
-                        "Gender", help="Pilih jenis kelamin", options=["Male", "Female"], required=False
+                        "Gender", help="Pilih jenis kelamin", options=["Pria", "Wanita"], required=False
                     ),
                     "pekerjaan_aktif_saat_ini": st.column_config.TextColumn("Pekerjaan Aktif", disabled=True),
                     "skill_utama": st.column_config.TextColumn("Skill Utama", disabled=True)

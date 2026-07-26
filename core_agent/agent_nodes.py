@@ -181,11 +181,10 @@ if config_path.exists():
         pass
 
 # LLM sebagai "Otak" Agent dinamis berdasarkan konfigurasi.
-# beberapa setting num_ctx: 4086, 8192, 12288, 16384
-LLMs = ChatOllama(model=model_chat_name, temperature=0.1, num_ctx=16384)
+# beberapa setting num_ctx: 4086, 8192, 12288, 16384, 20484, 32768
+LLMs = ChatOllama(model=model_chat_name, temperature=0.3, num_ctx=20484)
 
 panggil_otak_llm = AIBrainProcessor(LLMs, tools, system_prompt)
-
 
 # NODE 3 & 4: Tangan Eksekutor Tool
 eksekutor_safe = ToolNode(safe_tools)
