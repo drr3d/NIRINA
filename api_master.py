@@ -45,7 +45,7 @@ except ImportError:
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # 2. Konfigurasi Bot Telegram
-TG_TOKEN = '153304634:AAEyazO7JfoADXSp9wXT88RbB7sgbNYmEDA'
+TG_TOKEN = 'PLACE_YOUR_BOT_TOKEN_HERE'
 MAX_FILE_SIZE = 2 * 1024 * 1024  # Naikkan ke 2 MB menyesuaikan standar UI
 ALLOWED_EXTENSIONS = {'.pdf', '.doc', '.docx', '.txt'}
 
