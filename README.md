@@ -7,6 +7,26 @@
 
 Dengan dukungan **Hybrid RAG**, sistem dapat mempelajari data pelamar sekaligus dokumen internal perusahaan sehingga mampu memberikan rekomendasi yang lebih akurat dan sesuai konteks.
 
+---
+### Agent Architecture
+
+Untuk **release saat ini**, framework masih menggunakan **Single-Agent Architecture**. Artinya, seluruh proses *reasoning* dilakukan oleh **satu LLM**, sementara workflow diatur menggunakan graph dan berbagai executor (ToolNode).
+
+Meskipun demikian, framework ini tetap mengimplementasikan prinsip-prinsip utama **Agentic AI**, yaitu agent mampu:
+
+* 🧠 Melakukan *reasoning* terhadap permintaan pengguna.
+* 🎯 Memutuskan aksi berikutnya secara mandiri.
+* 🛠️ Memilih dan menjalankan tool yang paling sesuai tanpa hardcode workflow.
+* 🔄 Melakukan iterasi (*reason → act → observe → reason*) hingga tujuan tercapai.
+* ✅ Mengakhiri workflow secara mandiri ketika tugas telah selesai.
+
+> **Catatan**
+>
+> Single-Agent **bukan berarti** non-Agentic. Banyak framework agent modern seperti LangGraph ReAct Agent, OpenAI Agents, Claude Code, Cline, dan OpenHands juga menggunakan pendekatan **single-agent** dengan workflow berbasis graph dan pemanggilan tools secara dinamis.
+>
+> Perbedaan utamanya adalah pada **Multi-Agent Architecture**, di mana terdapat beberapa agent yang masing-masing memiliki LLM, prompt, dan proses reasoning sendiri, kemudian saling berkolaborasi untuk menyelesaikan suatu tugas.
+
+
 ### ✨ Fitur Utama
 
 - 📄 **Parsing CV Otomatis** (PDF, DOCX, TXT)

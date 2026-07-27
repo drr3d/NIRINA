@@ -1,19 +1,12 @@
 import operator
-import json
-from typing import Annotated, TypedDict, Any
-import importlib
-import pkgutil
+from typing import Annotated, TypedDict
 
 # Import LangChain & LangGraph components
 from langchain_core.messages import SystemMessage
-from langchain_ollama import ChatOllama
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode
 
 # Import dari file yang lain
 from .systemprompt_collection import system_prompt
-from .config import config_path, app_dir
-from .registry import ToolRegistry
 
 def optimasi_konteks_langchain(messages):
     """
@@ -153,39 +146,3 @@ class AIBrainProcessor:
 
     def __call__(self, state: AgentState) -> dict:
         return self._orchestrator(state)
-
-# --- AUTO-DISCOVERY PLUGIN ---
-# Sistem akan membaca otomatis semua file python di folder 'plugins'
-# Memanfaatkan app_dir yang sudah dideklarasikan di atas
-plugin_folder = app_dir / "plugins"
-
-if plugin_folder.exists():
-    # pkgutil.iter_modules membutuhkan list of string path
-    for _, module_name, _ in pkgutil.iter_modules([str(plugin_folder)]):
-        importlib.import_module(f"plugins.{module_name}")
-
-# Kumpulkan tools untuk diexport ke agent_nodes.py
-safe_tools = ToolRegistry.safe_tools
-sensitive_tools = ToolRegistry.sensitive_tools
-tools = safe_tools + sensitive_tools
-
-# --- [DYNAMIC CONFIG] MEMBACA SETTING MODEL UNTUK CHAT AGENT ---
-model_chat_name = "qwen2.5:1.5b" # Default fallback jika config tidak ada
-if config_path.exists():
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config_data = json.load(f)
-            # Mengambil model_chat_agent, jika tidak diset otomatis pakai qwen2.5:1.5b
-            model_chat_name = config_data.get("model_chat_agent", "qwen2.5:1.5b")
-    except Exception:
-        pass
-
-# LLM sebagai "Otak" Agent dinamis berdasarkan konfigurasi.
-# beberapa setting num_ctx: 4086, 8192, 12288, 16384, 20484, 32768
-LLMs = ChatOllama(model=model_chat_name, temperature=0.3, num_ctx=20484)
-
-panggil_otak_llm = AIBrainProcessor(LLMs, tools, system_prompt)
-
-# NODE 3 & 4: Tangan Eksekutor Tool
-eksekutor_safe = ToolNode(safe_tools)
-eksekutor_sensitive = ToolNode(sensitive_tools)
