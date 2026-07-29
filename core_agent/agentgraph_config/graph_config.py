@@ -4,17 +4,16 @@ from ..agent_factory import (
     panggil_otak_llm,
     eksekutor_safe,
     eksekutor_sensitive,
-    sensitive_tools
+    sensitive_tools, safe_tools
 )
-from ..registry import ToolRegistry
 from ..agent_router import DecisionRouter
 
 # ==========================================
 # 1. PERSIAPAN ROUTER DINAMIS
 # ==========================================
 # Kita tarik alat berdasarkan kategorinya langsung dari Registry
-safe_tools = ToolRegistry.get_tools("safe")
-sensitive_tools = ToolRegistry.get_tools("sensitive")
+#safe_tools = ToolRegistry.get_tools("safe")
+#sensitive_tools = ToolRegistry.get_tools("sensitive")
 
 # Injeksi peta alat ke Router agar ia tahu rute mana yang harus dipilih
 dynamic_router = DecisionRouter(

@@ -1,10 +1,9 @@
 from typing import List, Any, Dict
 from .agent_nodes import AgentState
-from .agent_factory import sensitive_tools
 
-# ==========================================
+# ============================================
 # --- 3. DEFINISI ROUTER (PENGATUR JALUR) ---
-# ==========================================
+# ============================================
 class DecisionRouter:
     """
     Router Dinamis untuk Framework LangGraph.
@@ -64,7 +63,12 @@ class DecisionRouter:
 
             self._logger(f"[Log Router] AI memakai Tool [{nama_tools_log}] -> Rute ke Kategori: '{kategori_tujuan}'")
             return kategori_tujuan
-            
+
+        # di _tentukan_rute_tool, sebelum return "selesai"
+        if not tool_calls and not getattr(pesan_terakhir, "content", "").strip():
+            self._logger("[Log Router] ⚠️ Respons kosong tanpa tool call terdeteksi -> retry")
+            return "retry_kosong"   # tambahkan edge baru di graph yang re-invoke node otak
+
         self._logger("[Log Router] Draf selesai. Langsung kirim jawaban ke User!")
         return "selesai"
 

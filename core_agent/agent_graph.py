@@ -1,4 +1,4 @@
-import os
+import os, json
 import importlib
 import streamlit as st
 import sqlite3
@@ -38,6 +38,9 @@ class AgenticEngine:
         
         # 1. Rakit Topologi Graf
         self._build_graph()
+
+        # cek hitl table
+        self._inisialisasi_tabel_hitl()
         
         # 2. Compile Graf dengan Interrupt Dynamic dari Konfigurasi
         self.executor = self.workflow.compile(
@@ -90,8 +93,68 @@ class AgenticEngine:
             else:
                 print(f"⚠️ PERINGATAN: Tipe konfigurasi '{item_type}' tidak dikenali.")
 
+    def _inisialisasi_tabel_hitl(self):
+        """Membuat tabel antrean HITL dan melakukan migrasi alter table jika kolom thread_id belum ada."""
+        try:
+            with self.db_conn as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                # 1. Buat tabel dengan skema terbaru (akan dieksekusi jika tabel benar-benar belum ada)
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS hitl_queue (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        thread_id TEXT,
+                        tools_name TEXT NOT NULL,
+                        tool_args TEXT NOT NULL,
+                        status TEXT DEFAULT 'MENUNGGU_PERSETUJUAN',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # 2. Pengecekan kolom (Migrasi Dinamis) untuk tabel lama
+                cursor = conn.execute("PRAGMA table_info(hitl_queue)")
+                kolom_kolom = [row[1] for row in cursor.fetchall()]
+                
+                # Jika tabel sudah ada dari versi sebelumnya tapi belum punya thread_id
+                if 'thread_id' not in kolom_kolom:
+                    conn.execute("ALTER TABLE hitl_queue ADD COLUMN thread_id TEXT")
+                    print("✅ [Migrasi DB] Berhasil menambahkan kolom 'thread_id' ke tabel 'hitl_queue'.")
+                    
+        except Exception as e:
+            print(f"⚠️ [Error DB] Gagal inisialisasi atau migrasi tabel hitl_queue: {e}")
+
+
+    def _rekam_antrean_hitl(self, thread_id: str, tool_calls: list):
+        """Merekam state yang tertahan ke database untuk Watchdog Automation."""
+        try:
+            # Ekstraksi nama dan argumen
+            tools_name = ", ".join([tc["name"] for tc in tool_calls])
+            tool_args = json.dumps([tc["args"] for tc in tool_calls])
+            
+            with self.db_conn as conn:
+                # Cek dulu agar tidak duplikat jika user sekadar me-refresh UI
+                cursor = conn.execute("SELECT id FROM hitl_queue WHERE thread_id = ? AND status = 'MENUNGGU_PERSETUJUAN'", (thread_id,))
+                if not cursor.fetchone():
+                    conn.execute(
+                        "INSERT INTO hitl_queue (thread_id, tools_name, tool_args, status) VALUES (?, ?, ?, 'MENUNGGU_PERSETUJUAN')",
+                        (thread_id, tools_name, tool_args)
+                    )
+                    print(f"📡 [Watchdog] Menambahkan {tools_name} (Thread: {thread_id}) ke antrean.")
+        except Exception as e:
+            print(f"⚠️ [Error DB] Gagal merekam antrean HITL: {e}")
+
+    def _update_antrean_hitl(self, thread_id: str, status_baru: str):
+        """Memperbarui status saat user mengklik Setuju atau Batal di UI."""
+        try:
+            with self.db_conn as conn:
+                conn.execute(
+                    "UPDATE hitl_queue SET status = ? WHERE thread_id = ? AND status = 'MENUNGGU_PERSETUJUAN'",
+                    (status_baru, thread_id)
+                )
+        except Exception as e:
+            pass
+
     def run(self, user_input: str = None, thread_id: str = "default_thread", is_approval: bool = False, user_role: str = "Staff") -> Dict[str, Any]:
-        config = {"configurable": {"thread_id": thread_id, "user_role": user_role}}
+        config = {"configurable": {"thread_id": thread_id, "user_role": user_role}, "recursion_limit": 50}
         current_state = self.executor.get_state(config)
         
         # PERUBAHAN DI SINI: Deteksi Pause secara dinamis tanpa hardcode nama node
@@ -119,7 +182,20 @@ class AgenticEngine:
         else:
             if not is_approval and user_input:
                 self.executor.invoke({"messages": [HumanMessage(content=user_input)]}, config=config)
-            
+
+        # ==========================================
+        # FASE 2: EVALUASI PASCA-EKSEKUSI
+        # ==========================================
+        # Kita ambil state TERBARU setelah invoke selesai
+        state_terbaru = self.executor.get_state(config)
+        
+        # Jika state terbaru ternyata memiliki .next, artinya Graf BARU SAJA membeku (pause)!
+        if state_terbaru.next:
+            pesan_terakhir = state_terbaru.values["messages"][-1]
+            if hasattr(pesan_terakhir, "tool_calls") and pesan_terakhir.tool_calls:
+                # Rekam momen ini ke database!
+                self._rekam_antrean_hitl(thread_id, pesan_terakhir.tool_calls)
+
         return self.executor.get_state(config)
 
 # ==========================================
@@ -171,7 +247,16 @@ engine = get_agent_engine()
 def proses_chat_agent(user_input: str = None, thread_id: str = "hr_session_001", is_approval: bool = False, user_role: str = "Staff") -> dict:
     try:
         # 1. Jalankan core engine (Memori kini akan bertahan selama server menyala)
+        from timeit import default_timer as timer
+
+        # Start the timer
+        start = timer()
+        print(f"⚠️ [proses_chat_agent] START")
         state_terbaru = engine.run(user_input, thread_id, is_approval, user_role)
+        # End the timer
+        end = timer()
+        print(f"⚠️ [proses_chat_agent] SELESAI: {end - start}")
+
         # 2. Terjemahkan hasilnya menggunakan Adapter untuk UI Streamlit
         return StreamlitAgentAdapter.process_state_to_ui(state_terbaru)
     except Exception as e:

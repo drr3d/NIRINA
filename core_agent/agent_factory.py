@@ -29,13 +29,17 @@ if config_path.exists():
     except Exception:
         pass
 
-LLMs = ChatOllama(model=model_chat_name, temperature=0.3, num_ctx=20484)
-
+# num_ctx = 4096, 8192, 16384
+LLMs = ChatOllama(model=model_chat_name,
+                  temperature=0.3, 
+                  num_ctx=20484,
+                  reasoning=False,   # <- matikan thinking, ini pemicu bug kosong di qwen3.5+tools
+                  )
 
 # ==========================================
 # ==========================================
 # Kumpulkan tools 
-panggil_otak_llm = AIBrainProcessor(LLMs, ToolRegistry.get_all_tools(), system_prompt)
+panggil_otak_llm = AIBrainProcessor(LLMs, ToolRegistry.get_all_tools(), system_prompt, enable_optimization=True)
 
 # 2. Tarik alat dari kategori default (hasil dari cara lama is_sensitive)
 safe_tools = ToolRegistry.get_tools("safe")
