@@ -5,7 +5,7 @@ services:
     environment:
       - POSTGRES_DB=litellm
       - POSTGRES_USER=litellm
-      - POSTGRES_PASSWORD=pgpassword
+      - POSTGRES_PASSWORD=place_your_pg_pass
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -20,10 +20,10 @@ services:
     ports:
       - "4000:4000"
     environment:
-      - LITELLM_MASTER_KEY=sk-123456
-      - DATABASE_URL=postgresql://litellm:pgpassword@db:5432/litellm
+      - LITELLM_MASTER_KEY=sk-LITELLM_MASTERKEY_HERE
+      - DATABASE_URL=postgresql://litellm:place_your_pg_pass@db:5432/litellm
       - UI_USERNAME=admin
-      - UI_PASSWORD=uipassword
+      - UI_PASSWORD=place_your_litellmui_pass
     volumes:
       - ./config.yaml:/app/config.yaml
     command: ["--config", "/app/config.yaml"]
