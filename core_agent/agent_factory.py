@@ -32,14 +32,14 @@ if use_gateway:
     LLMs = ChatOpenAI(
         model="rekrutyuk-main",
         base_url="http://localhost:4000/v1",
-        api_key="sk-nMhxuO8AJLHJkjS6d9yzTQ",   # virtual key dari Langkah 9, BUKAN master key
+        api_key="sk-PLACE_YOUR_LITELLM_VK_HERE",   # virtual key, get it from litellm ui
         temperature=0.3,
     )
 
     LLMsmall = ChatOpenAI(
         model="rekrutyuk-small",
         base_url="http://localhost:4000/v1",
-        api_key="ssk-nMhxuO8AJLHJkjS6d9yzTQ",
+        api_key="sk-PLACE_YOUR_LITELLM_VK_HERE",  # virtual key, get it from litellm ui
         temperature=0.3,
     )
 else:
