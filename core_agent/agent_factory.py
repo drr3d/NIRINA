@@ -1,11 +1,9 @@
-# ==========================================
-# File: core_agent/agent_components.py
-# ==========================================
 import importlib
 import pkgutil
 import json
 from langgraph.prebuilt import ToolNode
 from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 
 # Import class inti dari agent_nodes
 from .agent_nodes import AIBrainProcessor
@@ -29,17 +27,39 @@ if config_path.exists():
     except Exception:
         pass
 
-# num_ctx = 4096, 8192, 16384
-LLMs = ChatOllama(model=model_chat_name,
-                  temperature=0.3, 
-                  num_ctx=20484,
-                  reasoning=False,   # <- matikan thinking, ini pemicu bug kosong di qwen3.5+tools
-                  )
+use_gateway = False
+if use_gateway:
+    LLMs = ChatOpenAI(
+        model="rekrutyuk-main",
+        base_url="http://localhost:4000/v1",
+        api_key="sk-nMhxuO8AJLHJkjS6d9yzTQ",   # virtual key dari Langkah 9, BUKAN master key
+        temperature=0.3,
+    )
 
+    LLMsmall = ChatOpenAI(
+        model="rekrutyuk-small",
+        base_url="http://localhost:4000/v1",
+        api_key="ssk-nMhxuO8AJLHJkjS6d9yzTQ",
+        temperature=0.3,
+    )
+else:
+    # num_ctx = 4096, 8192, 16384
+    LLMs = ChatOllama(model=model_chat_name,
+                    temperature=0.3, 
+                    num_ctx=20484,
+                    reasoning=True,   # <- matikan thinking, ini pemicu bug kosong di qwen3.5+tools
+                    )
+
+    # for evaluasi_kandidat
+    LLMsmall = ChatOllama(model="qwen2.5:1.5b",
+                    temperature=0.3, 
+                    num_ctx=20484,
+                    reasoning=True,   # <- matikan thinking, ini pemicu bug kosong di qwen3.5+tools
+                    )
 # ==========================================
 # ==========================================
 # Kumpulkan tools 
-panggil_otak_llm = AIBrainProcessor(LLMs, ToolRegistry.get_all_tools(), system_prompt, enable_optimization=True)
+panggil_otak_llm = AIBrainProcessor(LLMs, ToolRegistry.get_all_tools(), system_prompt, enable_optimization=False)
 
 # 2. Tarik alat dari kategori default (hasil dari cara lama is_sensitive)
 safe_tools = ToolRegistry.get_tools("safe")
