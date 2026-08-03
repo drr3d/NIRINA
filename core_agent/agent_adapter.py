@@ -4,6 +4,7 @@ import json
 # ==========================================
 # 1. UI REGISTRY (Agar Kontributor Bisa Menambah Custom View Tool)
 # ==========================================
+
 class ToolFormatterRegistry:
     """Registry untuk memformat tampilan Tool di UI secara dinamis (Plugin System)."""
     _registry: Dict[str, Callable[[Dict[str, Any]], str]] = {}
@@ -93,38 +94,53 @@ class StreamlitAgentAdapter:
 
         # Skenario 3: Ambil Jawaban Akhir
         jawaban_final = "Maaf, tidak ada respons yang valid dari agen."
+        print(f"process_state_to_ui state.values: {state.values}")
         if "messages" in state.values:
-            messages = state.values["messages"]
+            from langchain_core.messages import AIMessage
             
+            messages = state.values["messages"]
+            kumpulan_kesimpulan = []
+            
+            # 1. Cari input Human terakhir
             last_human_idx = -1
             for i in range(len(messages) - 1, -1, -1):
-                if messages[i].type == "human":
+                if getattr(messages[i], "type", "") == "human":
                     last_human_idx = i
                     break
             
-            if last_human_idx != -1:
-                kumpulan_teks_ai = []
-                teks_cadangan_pemikiran = [] # [BARU] Menyimpan pemikiran AI sebelum blank
+            start_idx = last_human_idx + 1 if last_human_idx != -1 else 0
+            print(f"process_state_to_ui last_human_idx: {last_human_idx}\nmessages: {messages}\nstart_idx|len messages: {start_idx} | {len(messages)}")
+            # 2. Filter pesan AI
+            if start_idx < len(messages):
+                for msg in messages[start_idx:]:
+                    is_ai_msg = isinstance(msg, AIMessage) or getattr(msg, "type", "") == "ai"
+                    
+                    if is_ai_msg:
+                        # Cek apakah pesan ini memanggil tool?
+                        has_tools = bool(getattr(msg, "tool_calls", []))
+                        
+                        # KITA HANYA PEDULI PADA PESAN YANG *TIDAK* MEMANGGIL TOOL
+                        # Karena ini adalah pesan yang ditujukan langsung ke User
+                        if not has_tools:
+                            isi_teks = str(getattr(msg, "content", "") or "").strip()
+                            kwargs = getattr(msg, "additional_kwargs", {})
+                            #teks_pemikiran = str(kwargs.get("reasoning_content", "") or "").strip()
+                            
+                            blok_teks = []
+                            #if teks_pemikiran:
+                            #    blok_teks.append(f"> 🧠 **Pemikiran AI:**\n> {teks_pemikiran}")
+                            if isi_teks:
+                                blok_teks.append(isi_teks)
+                                
+                            teks_gabungan = "\n\n".join(blok_teks)
+                            if teks_gabungan:
+                                kumpulan_kesimpulan.append(teks_gabungan)
+                                #kumpulan_kesimpulan.append("")
                 
-                for msg in messages[last_human_idx + 1:]:
-                    if msg.type == "ai" and msg.content and msg.content.strip():
-                        if not getattr(msg, "tool_calls", []):
-                            # Teks murni (Kesimpulan akhir)
-                            kumpulan_teks_ai.append(msg.content.strip())
-                        else:
-                            # Teks pengantar sebelum memanggil tool
-                            teks_cadangan_pemikiran.append(msg.content.strip())
-                
-                # [BARU] Logika Evaluasi UI
-                if kumpulan_teks_ai:
-                    jawaban_final = "\n\n---\n\n".join(kumpulan_teks_ai)
-                elif teks_cadangan_pemikiran:
-                    # Jika AI blank di akhir, selamatkan UI dengan menampilkan pemikirannya
-                    jawaban_final = (
-                        "*(AI sedang menyusun data)*\n\n" + 
-                        "\n\n".join(teks_cadangan_pemikiran) + 
-                        "\n\n---\n⚠️ *Sistem: AI telah berhasil menarik data dari alat, namun tidak dapat merangkumnya. Silakan persempit kriteria pencarian Anda.*"
-                    )
+                # 3. Logika UI Terakhir
+                if kumpulan_kesimpulan:
+                    # AMBIL HANYA KESIMPULAN YANG PALING AKHIR [-1]
+                    jawaban_final = kumpulan_kesimpulan[-1]
 
         return {
             "status": "selesai",

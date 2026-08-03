@@ -3,7 +3,7 @@ from typing import Annotated, TypedDict, Any
 
 # Import LangChain & LangGraph components
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, RemoveMessage
 from langgraph.graph.message import add_messages
 
 # ==========================================
@@ -37,7 +37,8 @@ def buat_ringkasan_memori(pesan_lama: list, fast_llm: Any, ringkasan_sebelumnya:
 
 def optimasi_konteks_langchain(messages, current_summary="", fast_llm=None):
     """
-    Optimasi berbasis Turn Boundary
+    Optimasi berbasis 'Batas Giliran' (Turn Boundary) -- pengganti sliding-window
+    lama yang berbasis jarak-dari-ujung list.
     """
     from langchain_core.messages import ToolMessage
 
@@ -165,6 +166,17 @@ class AIBrainProcessor:
             )
         )
 
+    def _build_retry_reminder(self, percobaan_ke: int) -> SystemMessage:
+        return SystemMessage(
+            content=(
+                f"[⚠️ PERINGATAN SISTEM: Respons kamu di giliran sebelumnya KOSONG "
+                f"(percobaan ke-{percobaan_ke}). Lihat kembali hasil tool paling akhir "
+                f"di atas, analisis, lalu WAJIB tuliskan jawaban teks akhir untuk user "
+                f"SEKARANG. Jangan panggil tool yang sama lagi jika tidak perlu, dan "
+                f"jangan kirim respons kosong lagi.]"
+            )
+        )
+
     def _extract_pending_tasks(self, response_content: str) -> str:
         """Mengekstrak blok To-Do list (Scratchpad) dari balasan AI."""
         if not response_content:
@@ -192,6 +204,8 @@ class AIBrainProcessor:
         pending_tasks = state.get("pending_tasks", "")
         current_summary = state.get("summary", "") # <-- Ambil ringkasan saat ini
 
+        revision_count = state.get("revision_count", 0) # <-- FIX RETRY KOSONG: hitungan percobaan ulang
+
         # 1. [OPTIMASI KV-CACHE] System prompt SELALU statis apa adanya (base_prompt murni),
         # tidak pernah lagi disisipi teks dinamis di sini -- lihat penjelasan di _build_pending_reminder.
         if messages and isinstance(messages[0], SystemMessage):
@@ -214,6 +228,12 @@ class AIBrainProcessor:
         # cuma untuk panggilan invoke() ini -- tidak ikut ke-return/ke-simpan ke state.
         if pending_tasks:
             messages_dioptimalkan = messages_dioptimalkan + [self._build_pending_reminder(pending_tasks)]
+
+        # 3b. [FIX RETRY KOSONG] Kalau ini hasil loop-back dari router karena giliran
+        # sebelumnya kosong, tempel reminder ekstra biar model tidak mengulang kesalahan
+        # yang sama. Sama seperti reminder lain: cuma untuk invoke() ini, tidak disimpan.
+        if revision_count > 0:
+            messages_dioptimalkan = messages_dioptimalkan + [self._build_retry_reminder(revision_count)]
         
         print("\n[Log Sistem] AI Utama sedang menganalisis input atau menyusun jawaban...")
         
@@ -251,6 +271,28 @@ class AIBrainProcessor:
             # Jika respon hanya memanggil tool tanpa teks, biarkan task pending sebelumnya (jangan ditimpa string kosong)
             # Kecuali jika ingin meresetnya. Untuk amannya, kita abaikan update jika tidak ada text.
             pass
+
+        # ==========================================
+        # 8. [TAMBAHAN BARU] HAPUS PESAN LAMA DARI SQLITE (STATE CLEANER)
+        # ==========================================
+        # Agar saat sesi lama di-load, SQLite tidak menarik ratusan pesan ke RAM.
+        # Angka ini adalah sisa pesan yang dibiarkan "hidup" di database.
+        BATAS_SIMPAN_DB = 6 
+        semua_pesan_asli = state.get("messages", [])
+
+        if len(semua_pesan_asli) > BATAS_SIMPAN_DB:
+            # Ambil semua pesan dari awal hingga batas pemotongan
+            pesan_usang = semua_pesan_asli[:-BATAS_SIMPAN_DB]
+            
+            # Buat list perintah RemoveMessage berdasarkan ID pesan
+            # (Pastikan pesan memiliki ID, LangGraph otomatis memberikannya)
+            perintah_hapus = [RemoveMessage(id=msg.id) for msg in pesan_usang if msg.id]
+            
+            # Gabungkan perintah hapus ke dalam array messages yang akan di-update
+            # LangGraph akan membaca RemoveMessage ini dan menghapusnya dari SQLite!
+            update_state["messages"] = perintah_hapus + update_state["messages"]
+            
+            print(f"\n[🧹 State Cleaner] Menginstruksikan SQLite untuk menghapus {len(perintah_hapus)} pesan usang dari memori hard disk!")
 
         return update_state
 
