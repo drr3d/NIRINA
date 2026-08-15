@@ -2,26 +2,14 @@ import streamlit as st
 import uuid
 
 # --- IMPORT MODUL KUSTOM ---
-from database.chat_db import init_chat_db, load_chat_history
+from views import(tab1_aichat, tab2_knowledge)
 from database.knowledge_db import init_knowledge_db
-from database.interview_db import init_interview_db
-from database.lowongan_db import init_lowongan_db
 from core_agent.config import sqlite_db_path, app_dir
 
-from views import tab5_interview, tab4_lowongan, tab3_hrknowledge, tab2_cvkandidat, tab1_aichat
-
 # --- KONFIGURASI HALAMAN ---
-st.set_page_config(page_title="HR Talent AI", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="N.I.R.I.N.A", page_icon="🤖", layout="wide")
 st.markdown("<style>.stChatMessage { padding-bottom: 20px; }</style>", unsafe_allow_html=True)
-st.title("🤖 HR Talent Acquisition Workspace")
-
-# [NEW UPGRADE]: Folder untuk menyimpan dokumen fisik HR Knowledge
-knowledge_dir = app_dir / "knowledge_docs"
-knowledge_dir.mkdir(parents=True, exist_ok=True)
-
-# --- TAMBAHAN BARU: Folder Staging Area untuk Chat ---
-temp_dir = app_dir / "temp_uploads"
-temp_dir.mkdir(parents=True, exist_ok=True)
+st.title("🤖 Code Workspace")
 
 # ==========================================
 # --- SIDEBAR: SIMULASI LOGIN & HAK AKSES ---
@@ -41,11 +29,6 @@ def update_identity():
     st.session_state.menunggu_approval = False
     st.session_state.data_approval = None
     
-    # Reload riwayat chat SECARA EKSKLUSIF untuk identitas baru
-    st.session_state.messages = load_chat_history(
-        thread_id=st.session_state.get("active_thread_id", "Sesi Utama (Default)"),
-        username=st.session_state.username
-    )
 
 # 2. INISIALISASI IDENTITAS AWAL (Saat aplikasi pertama kali dibuka)
 if "username" not in st.session_state:
@@ -64,11 +47,11 @@ st.sidebar.text_input(
 
 st.sidebar.selectbox(
     "Pilih Role Anda:", 
-    ["Staff", "HR Admin"],
+    ["Staff", "Admin"],
     index=0 if st.session_state.user_role == "Staff" else 1,
     key="widget_role",                # <-- Streamlit akan menyimpan role kesini
     on_change=update_identity,        # <-- Memicu fungsi saat dropdown diganti
-    help="Role 'HR Admin' diperlukan untuk mengunduh dokumen fisik CV asli."
+    help="Role 'Admin'."
 )
 
 st.sidebar.info(f"Aktif sebagai: **{st.session_state.user_role}** ({st.session_state.username})")
@@ -76,10 +59,14 @@ st.sidebar.info(f"Aktif sebagai: **{st.session_state.user_role}** ({st.session_s
 # ==========================================
 # --- INISIALISASI SESSION STATE & DB ---
 # ==========================================
-init_chat_db() # Pastikan tabel DB sudah ada
+# [NEW UPGRADE]: Folder untuk menyimpan dokumen fisik HR Knowledge
+knowledge_dir = app_dir / "knowledge_docs"
+knowledge_dir.mkdir(parents=True, exist_ok=True)
+
+#init_chat_db() # Pastikan tabel DB sudah ada
 init_knowledge_db()
-init_interview_db()
-init_lowongan_db()
+#init_interview_db()
+#init_lowongan_db()
 
 # 1. Manajemen Daftar Thread (Sesi)
 if "daftar_thread" not in st.session_state:
@@ -122,47 +109,19 @@ if pilihan_sesi != st.session_state.active_thread_id:
     st.session_state.menunggu_approval = False
     st.session_state.data_approval = None
     
-    st.session_state.messages = load_chat_history(
-        thread_id=st.session_state.active_thread_id,
-        username=st.session_state.username
-    )
+
     st.rerun()
-
-# 4. Fallback Pemuatan Awal Data Obrolan
-if "messages" not in st.session_state:
-    st.session_state.messages = load_chat_history(
-        thread_id=st.session_state.active_thread_id,
-        username=st.session_state.username
-    )
-
-if "menunggu_approval" not in st.session_state:
-    st.session_state.menunggu_approval = False
-if "data_approval" not in st.session_state:
-    st.session_state.data_approval = None
 
 # ==========================================
 # --- LAYOUTING TABS ---
 # ==========================================
-# [NEW UPGRADE]: Menambahkan Tab 3 untuk Knowledge Base
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "💬 AI Assistant", 
-    "🗂️ Database Kandidat", 
-    "📚 HR Knowledge Base", 
-    "📢 Lowongan & Screening",
-    "📅 Jadwal Interview"  # <-- Tambahkan pintu masuk Tab 5 di sini
+tab1, tab2, = st.tabs([
+    "💬 AI Assistant",
+    "📚 Knowledge Base",
 ])
 
 with tab1:
-    tab1_aichat.render(temp_dir)
+    tab1_aichat.render()
 
 with tab2:
-    tab2_cvkandidat.render(sqlite_db_path)
-
-with tab3:
-    tab3_hrknowledge.render(sqlite_db_path, knowledge_dir)
-
-with tab4:
-    tab4_lowongan.render(sqlite_db_path)
-
-with tab5:
-    tab5_interview.render(sqlite_db_path)
+    tab2_knowledge.render(sqlite_db_path, knowledge_dir)
