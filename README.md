@@ -1,104 +1,310 @@
 # 🤖 RekrutYuk
 <p align="center">
-  <img src="images/logo.png" width="20%">
+  <img src="images/NIRINA_logo.png" width="20%">
 </p>
 
-**RekrutYuk** bukan hanya aplikasi rekrutmen, tetapi sebuah framework **Agentic AI** untuk membangun sistem rekrutmen cerdas yang dapat disesuaikan dengan kebutuhan setiap perusahaan.
+# N.I.R.I.N.A.
 
-Dengan dukungan **Hybrid RAG**, sistem dapat mempelajari data pelamar sekaligus dokumen internal perusahaan sehingga mampu memberikan rekomendasi yang lebih akurat dan sesuai konteks.
-
----
-### Agent Architecture
-
-Untuk **release saat ini**, framework masih menggunakan **Single-Agent Architecture**. Artinya, seluruh proses *reasoning* dilakukan oleh **satu LLM**, sementara workflow diatur menggunakan graph dan berbagai executor (ToolNode).
-
-Meskipun demikian, framework ini tetap mengimplementasikan prinsip-prinsip utama **Agentic AI**, yaitu agent mampu:
-
-* 🧠 Melakukan *reasoning* terhadap permintaan pengguna.
-* 🎯 Memutuskan aksi berikutnya secara mandiri.
-* 🛠️ Memilih dan menjalankan tool yang paling sesuai tanpa hardcode workflow.
-* 🔄 Melakukan iterasi (*reason → act → observe → reason*) hingga tujuan tercapai.
-* ✅ Mengakhiri workflow secara mandiri ketika tugas telah selesai.
-
-> **Catatan**
->
-> Single-Agent **bukan berarti** non-Agentic. Banyak framework agent modern seperti LangGraph ReAct Agent, OpenAI Agents, Claude Code, Cline, dan OpenHands juga menggunakan pendekatan **single-agent** dengan workflow berbasis graph dan pemanggilan tools secara dinamis.
->
-> Perbedaan utamanya adalah pada **Multi-Agent Architecture**, di mana terdapat beberapa agent yang masing-masing memiliki LLM, prompt, dan proses reasoning sendiri, kemudian saling berkolaborasi untuk menyelesaikan suatu tugas.
-
-
-### ✨ Fitur Utama
-
-- 📄 **Parsing CV Otomatis** (PDF, DOCX, TXT)
-- 🎯 **Screening Kandidat** berdasarkan kebutuhan recruiter
-- 💼 **Manajemen Lowongan Pekerjaan**
-- 📝 **Membuat Pertanyaan Interview** secara otomatis
-- ⚖️ **Membandingkan Kandidat** berdasarkan skill, pengalaman, maupun kriteria tertentu
-- 💬 **AI Recruitment Assistant** untuk menjawab pertanyaan recruiter menggunakan bahasa natural
-- 📚 **Hybrid RAG** yang dapat memanfaatkan:
-  - Data CV pelamar
-  - SOP rekrutmen
-  - Panduan interview
-  - Kebijakan HR
-  - Knowledge base internal perusahaan
-- 🤖 **Agentic AI Workflow** yang dapat diperluas dengan tools dan workflow sesuai kebutuhan perusahaan
-- 🔌 **Plugin System** untuk menambahkan tool atau workflow baru dengan mudah
-- 🖥️ **100% Berjalan Secara Lokal** menggunakan Ollama, tanpa bergantung pada layanan AI cloud
-
-### 🔒 Keunggulan
-
-- Data pelamar tetap berada di infrastruktur perusahaan
-- Tidak ada biaya API AI bulanan
-- Mendukung model LLM lokal yang memiliki kemampuan Tool Calling
-- Seluruh workflow dapat dikustomisasi sesuai kebutuhan
-
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.11-blue?logo=python" />
-  <img src="https://img.shields.io/badge/LangGraph-Agentic_AI-00A67E" />
-  <img src="https://img.shields.io/badge/LangChain-Framework-1C3C3C" />
-  <img src="https://img.shields.io/github/license/drr3d/rekrutyuk" />
-  <img src="https://img.shields.io/github/last-commit/drr3d/rekrutyuk" />
-</p>
+> **NaN Intelligent Random Initiator Neuro-Artificial**  
+> A lightweight Agentic AI Framework designed to maximize the capabilities of small-parameter local LLMs through structured reasoning, tool orchestration, and stateful execution.
 
 ---
 
-## Disclaimer
+## 🧠 What is N.I.R.I.N.A.?
 
-This repository is an early public snapshot of the project. The production version is under active development and may differ significantly as new real-world requirements and features are continuously implemented.
+**N.I.R.I.N.A.** is a modular **Agentic AI Framework** designed to turn small local language models (SLMs) into capable, tool-using autonomous agents.
 
----
+Instead of relying entirely on large cloud-based models, N.I.R.I.N.A. focuses on improving the **system around the model**:
 
-### 🧠 The Tech Stack Inside
-*   **The Brain:** [Ollama](https://ollama.com/) + **Qwen3.5:4B** (Model Kecil tapi handal, dan sangat pas untuk VRAM lokal)
-*   **The Orchestrator:** **LangGraph** & **LangChain** (Arsitektur Agentic AI sejati dengan State Machine dinamis)
-*   **The Knowledge:** **ChromaDB** (Vektor database untuk Unstructured RAG) & **SQLite** (Structured RAG & memori permanen)
-*   **The Interface Control:** **Telegram Bot API & Local Watchdog** (Data Ingestion stage.)
-*   **The Runtime:** **Python 3.11** 🐍
+- Structured reasoning
+- Stateful execution
+- Controlled tool calling
+- Execution feedback
+- Iterative decision-making
+- Modular skill integration
 
----
+The core philosophy is simple:
 
-### 🌟 Arsitektur Utama: Agentic AI + RAG Dual-Core
-<p align="center">
-  <img src="images/mainflow.png" width="50%">
-</p>
+> **Don't make the model bigger. Make the system around the model smarter.**
 
-Aplikasi **RekrutYuk** ini bukan sekadar aplikasi CRUD biasa atau chatbot pasif, melainkan perpaduan dua teknologi AI terdepan saat ini:
-
-*   **Agentic AI Engine (Autonomous Reasoning):** Menggunakan graf dinamis LangGraph untuk memberikan AI "otak" dalam menentukan langkah selanjutnya. Agen bisa merencanakan strategi sendiri: kapan harus melihat daftar kandidat, kapan harus mendalami CV secara kualitatif, hingga mendeteksi *tool calling* secara otomatis.
-*   **Hybrid RAG Architecture (Local Knowledge Base):** 
-    *   *Unstructured RAG:* Memotong dan mengindeks berkas dokumen CV (PDF) mentah ke ChromaDB untuk pencarian semantik mendalam.
-    *   *Structured RAG:* Mengekstrak data berantakan dari AI menjadi skema JSON rapi di SQLite untuk kebutuhan statistik analitik HR yang presisi.
+N.I.R.I.N.A. is built on top of **LangGraph** and **LangChain**, providing a graph-driven execution layer where the LLM acts as the reasoning core while external capabilities are provided through modular tools.
 
 ---
 
-### 🎯 What Makes It Awesome?
+## 💡 Core Concept — Brain & Sensors(Tools)
 
-*   **Human-in-the-Loop (HITL) Guardrail:** Aksi sensitif (seperti posting lowongan atau hapus data) dikunci oleh interupsi graf. AI tidak akan mengeksekusi ke database sebelum mengirimkan notifikasi konfirmasi ke Telegram Anda. Tekan **"IYA"**, baru Agen AI bergerak!
-*   **Anti-Amnesia Persistent Memory:** Ditenagai oleh `SqliteSaver`, yang membuat agen AI ini punya memori jangka panjang. Biarpun aplikasi di-restart atau komputer mati, Agen tetap ingat siapa kandidat terakhir yang sedang dibahas dan apa tugas terpendingnya.
+N.I.R.I.N.A. follows a **Brain & Sensors Architecture**.
+
+### 🧠 The Brain
+
+The **Brain** is the core agent responsible for the cognitive and execution loop:
+
+- State management
+- Reasoning
+- Decision making
+- Tool selection
+- Workflow orchestration
+- Error handling
+- Execution feedback
+- Iterative reasoning
+
+The Brain remains relatively lightweight. External capabilities are delegated to modular Sensors.
+
+### 📡 The Sensors(Tools)
+
+**Sensors** are modular tools that extend what the agent can perceive and do.
+
+A Sensor can represent almost anything:
+
+- Web search
+- APIs
+- File processing
+- Database access
+- Security tools
+- System utilities
+- Custom business logic
+- Domain-specific skills
+
+Sensors can be added, removed, or replaced without fundamentally changing the Brain.
+
+This makes N.I.R.I.N.A. **domain-agnostic by design**.
 
 ---
 
-## 📚 Additional Documentation
+## ⚙️ Agent Execution Philosophy
 
-- [Getting Started](docs/getting-started.md)
-- [Known Limitations & Future Improvements](docs/known-limitations.md)
+N.I.R.I.N.A. is designed around the following execution principle:
+
+**Observe → Reason → Decide → Act → Observe Result → Reflect → Repeat**
+
+Instead of allowing an SLM to generate a complete solution purely through text generation, N.I.R.I.N.A. gives the model access to **real execution feedback**.
+
+A typical execution flow is:
+
+1. Receive the user request.
+2. Analyze the current state.
+3. Determine the next action.
+4. Select an appropriate tool or Sensor.
+5. Execute the tool.
+6. Observe the result.
+7. Evaluate the result.
+8. Continue, correct, or terminate the workflow.
+
+A failed tool execution can therefore become **feedback**, rather than simply a terminal failure.
+
+---
+
+## 🛡️ Hallucination Mitigation
+
+Small Language Models can be highly capable, but they are generally more sensitive to:
+
+- Reasoning drift
+- Invalid tool calls
+- Incorrect parameters
+- Fabricated APIs
+- Incorrect assumptions
+- Execution failures
+
+N.I.R.I.N.A. does **not** claim to eliminate hallucinations.
+
+Instead, it aims to **reduce the probability and impact of hallucinated actions** by constraining what the agent can actually execute.
+
+The architecture takes conceptual inspiration from research such as **Gorilla LLM** and **Voyager**.
+
+### 🦍 Gorilla — API & Tool Grounding
+
+The The **[Gorilla LLM](https://github.com/ShishirPatil/gorilla)** project demonstrates the importance of grounding LLM-generated actions against available APIs and tools. approach demonstrates the importance of grounding LLM-generated actions against available APIs and tools.
+
+N.I.R.I.N.A. adopts a similar principle:
+
+> **The model should reason over the tools that actually exist, rather than inventing capabilities.**
+
+Structured tool interfaces help constrain:
+
+- Available tools
+- Tool parameters
+- Expected inputs
+- Execution interfaces
+
+This reduces the search space for tool calling and makes invalid actions easier to detect.
+
+### 🧱 Voyager — Execution & Feedback
+
+The **[Voyager](https://github.com/MineDojo/Voyager)** project demonstrates the value of an iterative interaction loop where an agent learns from actual execution rather than relying purely on textual reasoning.
+ demonstrates the value of an iterative interaction loop where an agent learns from actual execution rather than relying purely on textual reasoning.
+
+N.I.R.I.N.A. applies a similar philosophy:
+
+**Plan → Execute → Observe → Evaluate → Correct → Execute Again**
+
+A failed tool call can therefore become **feedback** that helps guide the next action.
+
+---
+
+## ⚡ Key Features
+
+### 🧠 Model-Agnostic Optimization
+
+N.I.R.I.N.A. is designed to work across a wide range of local LLMs, from small-parameter models running on limited hardware to larger models deployed on high-performance systems.
+
+The framework focuses on improving agent capabilities through the system surrounding the model rather than depending solely on model size.
+
+N.I.R.I.N.A. can leverage:
+
+- Small local models for resource-efficient deployments
+- Larger local models when more capable hardware is available
+- Different model architectures and runtimes
+- Structured workflows and orchestration
+- Tool grounding
+- Execution feedback
+- Iterative reasoning
+
+The goal is not to enforce a specific model size, but to provide a flexible agent architecture that can **scale with the available hardware and model capabilities**.
+
+### 🔌 Modular Sensor Architecture
+
+Tools are treated as independent modules.
+
+New capabilities can be added without rewriting the entire agent.
+
+### 🔄 Graph-Driven Execution
+
+Built with **LangGraph**, allowing complex stateful workflows to be represented as explicit execution graphs.
+
+### 🧩 Tool-Oriented Reasoning
+
+The agent can reason about available tools and select appropriate capabilities based on the current task.
+
+### 🔁 Iterative Feedback Loop
+
+Tool execution results and errors can feed back into the reasoning process.
+
+### 🔒 Local & Private
+
+Designed to work with locally hosted models, minimizing dependency on external cloud inference.
+
+### 🌐 Domain Agnostic
+
+The same Brain can be equipped with completely different Sensors depending on the mission.
+
+---
+
+## 🚀 Implementations
+
+N.I.R.I.N.A. is designed to be **domain-agnostic**.
+
+The Brain remains largely unchanged while the Sensor layer can be customized for different missions.
+
+### 📄 HR Recruitment Agent
+
+**Status:** `Available`
+
+Example capabilities:
+
+- Resume parsing
+- Candidate information extraction
+- Candidate evaluation
+- Recruitment workflow orchestration
+- Interview workflow handling
+
+### 🛡️ Security & Recon Agent
+
+**Status:** `Work in Progress`
+
+Example capabilities:
+
+- Endpoint discovery
+- Web reconnaissance
+- Deep crawling
+- Security-oriented tool orchestration
+- Automated reconnaissance workflows
+
+> Tools can be isolated from the core agent environment when required.
+
+---
+
+## 🏗️ Architecture
+
+N.I.R.I.N.A. separates **reasoning** from **capabilities**.
+
+The architecture consists of several conceptual layers:
+
+### Brain
+
+The central agent layer responsible for:
+
+- State
+- Reasoning
+- Decision making
+- Workflow control
+- Execution loops
+
+### Sensors
+
+The modular tool layer responsible for providing external capabilities to the Brain.
+
+### Execution Layer
+
+The execution layer connects reasoning with real-world actions through structured tool calls and feedback.
+
+### Model Layer
+
+N.I.R.I.N.A. is designed to work with locally hosted small-parameter models through runtimes such as:
+
+- Ollama
+- llama.cpp
+
+This separation allows the same Brain architecture to operate across different domains by changing the available Sensors and models.
+
+---
+
+## 🛠️ Technology Stack
+
+| Component | Technology |
+|---|---|
+| Agent Framework | LangGraph |
+| Tool Integration | LangChain |
+| LLM Runtime | Ollama / llama.cpp |
+| Local Models | Qwen, Llama, and other SLMs |
+| Language | Python 3.11+ |
+| UI | Streamlit |
+| Architecture Inspiration | Gorilla LLM, Voyager |
+
+---
+
+## 🎯 Design Goals
+
+N.I.R.I.N.A. is built around several core goals:
+
+1. **Make small local models more useful.**
+2. **Reduce unnecessary dependence on large cloud models.**
+3. **Make tool execution explicit and controllable.**
+4. **Use execution feedback to improve reliability.**
+5. **Keep agent capabilities modular.**
+6. **Make complex agent workflows observable and debuggable.**
+7. **Make the framework adaptable to different domains.**
+
+---
+
+## 📌 Project Philosophy
+
+> **The LLM doesn't need to know everything.**  
+> **It needs to know how to think, when to act, and which Sensor/Tool to use.**
+
+N.I.R.I.N.A. treats the LLM as the **reasoning core**, while Sensors/Tool provide the capabilities required to interact with the real world.
+
+**Small Model. Structured Brain. Modular Sensors/Tool. Real Execution.**
+
+---
+
+## 📊 Project Status
+
+> 🚧 **N.I.R.I.N.A. is currently under active development.**
+
+The framework architecture is evolving as new agent workflows, tools, models, and execution strategies are tested.
+
+---
+
+## 📜 License
+
+License information will be added as the project approaches public release.
