@@ -1,4 +1,3 @@
-# 🤖 RekrutYuk
 <p align="center">
   <img src="images/NIRINA_logo.png" width="20%">
 </p>
