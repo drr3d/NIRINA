@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="images/NIRINA_logo.png" width="20%">
+  <img src="images/NIRINA_Logo.png" width="20%">
 </p>
 
 # N.I.R.I.N.A.
