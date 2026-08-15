@@ -1,10 +1,6 @@
 from typing import Dict, Any, Callable
 import json
 
-# ==========================================
-# 1. UI REGISTRY (Agar Kontributor Bisa Menambah Custom View Tool)
-# ==========================================
-
 class ToolFormatterRegistry:
     """Registry untuk memformat tampilan Tool di UI secara dinamis (Plugin System)."""
     _registry: Dict[str, Callable[[Dict[str, Any]], str]] = {}
@@ -47,33 +43,67 @@ class StreamlitAgentAdapter:
     
     @staticmethod
     def process_state_to_ui(state) -> Dict[str, Any]:
-        # PERUBAHAN DI SINI: Deteksi status butuh persetujuan secara universal
+        # Skenario 1: Deteksi status butuh persetujuan secara universal
         if state.next:
-            pesan_terakhir = state.values["messages"][-1]
-            tool_calls = getattr(pesan_terakhir, "tool_calls", [])
+            tool_calls = []
+            invalid_calls = []
             
-            if tool_calls:
+            # Cari backwards untuk menemukan tool_calls ATAU invalid_tool_calls
+            for msg in reversed(state.values["messages"]):
+                calls = getattr(msg, "tool_calls", [])
+                invalids = getattr(msg, "invalid_tool_calls", [])
+                
+                if calls or invalids:
+                    tool_calls = calls
+                    invalid_calls = invalids
+                    break # Langsung berhenti saat menemukan percobaan tool terbaru
+            
+            # Jika ditemukan Tool valid ataupun cacat (invalid)
+            if tool_calls or invalid_calls:
                 detail_pesan = []
-                for idx, tc in enumerate(tool_calls, 1):
+                counter = 1
+                
+                # 1. Tangani Tool yang Valid
+                for tc in tool_calls:
                     nama_tool = tc["name"]
                     argumen_tool = tc["args"]
-                    
                     formatted_arg = ToolFormatterRegistry.format(nama_tool, argumen_tool)
-                    detail_pesan.append(f"{idx}. Tool: **{nama_tool}**\n{formatted_arg}")
+                    detail_pesan.append(f"{counter}. Tool: **{nama_tool}**\n{formatted_arg}")
+                    counter += 1
                 
-                # Menampilkan nama Node yang sedang ditahan (opsional untuk info debug UI)
+                # 2. Tangani Tool yang Cacat/Invalid (Penyakit Local LLM)
+                for tc in invalid_calls:
+                    nama_tool = tc.get("name", "UnknownTool")
+                    err_msg = tc.get("error", "Kesalahan parsing JSON dari AI")
+                    detail_pesan.append(f"{counter}. ❌ Tool: **{nama_tool}** (GAGAL PARSING)\n   Alasan: `{err_msg}`\n   Raw Data: `{tc.get('raw', '')}`")
+                    counter += 1
+                
                 node_tertahan = ", ".join(state.next)
                 
                 pesan_gabungan = (
                     f"### ⚠️ KONFIRMASI TINDAKAN (Menunggu di: {node_tertahan})\n"
-                    "AI memerlukan konfirmasi persetujuan Anda untuk melakukan tindakan berikut:\n\n" + 
+                    "AI memerlukan konfirmasi Anda untuk tindakan berikut:\n\n" + 
                     "\n\n".join(detail_pesan)
                 )
+                
                 return {
                     "status": "butuh_persetujuan",
-                    "tool": tool_calls[0]["name"] if len(tool_calls) == 1 else "multiple_tools",
-                    "args": tool_calls[0]["args"] if len(tool_calls) == 1 else tool_calls,
+                    "tool": tool_calls[0]["name"] if tool_calls else "invalid_tool",
+                    "args": tool_calls[0]["args"] if tool_calls else {},
                     "pesan": pesan_gabungan
+                }
+            else:
+                # 3. DETEKSI SABOTASE: Graph tertahan, tapi Tool tidak ada!
+                return {
+                    "status": "butuh_persetujuan", 
+                    "tool": "error_state_cleaner",
+                    "args": {},
+                    "pesan": (
+                        f"### ⚠️ GRAPH TERTUNDA DI NODE: {', '.join(state.next)}\n\n"
+                        "**DIAGNOSTIK SISTEM:** Adapter tidak menemukan riwayat pemanggilan Tool. "
+                        "Kemungkinan besar pesan Tool Call baru saja **terhapus oleh [🧹 State Cleaner]** "
+                        "sebelum UI sempat membacanya."
+                    )
                 }
 
         # Skenario 2: Ekstraksi Link Download
@@ -94,52 +124,47 @@ class StreamlitAgentAdapter:
 
         # Skenario 3: Ambil Jawaban Akhir
         jawaban_final = "Maaf, tidak ada respons yang valid dari agen."
-        print(f"process_state_to_ui state.values: {state.values}")
+        #print(f"process_state_to_ui state.values: {state.values}")
         if "messages" in state.values:
             from langchain_core.messages import AIMessage
             
             messages = state.values["messages"]
             kumpulan_kesimpulan = []
-            
-            # 1. Cari input Human terakhir
+            print(f"process_state_to_ui state.values: {messages[-2:]}")
+            # 1. Cari input Human Asli terakhir (ABAIKAN pesan intervensi [SISTEM])
             last_human_idx = -1
             for i in range(len(messages) - 1, -1, -1):
-                if getattr(messages[i], "type", "") == "human":
-                    last_human_idx = i
-                    break
+                msg = messages[i]
+                if getattr(msg, "type", "") == "human":
+                    content_str = str(getattr(msg, "content", "") or "")
+                    # Kunci perbaikan: abaikan pesan otomatis dari sistem/router
+                    if not content_str.startswith("[SISTEM"):
+                        last_human_idx = i
+                        break
             
             start_idx = last_human_idx + 1 if last_human_idx != -1 else 0
-            print(f"process_state_to_ui last_human_idx: {last_human_idx}\nmessages: {messages}\nstart_idx|len messages: {start_idx} | {len(messages)}")
+            
             # 2. Filter pesan AI
             if start_idx < len(messages):
                 for msg in messages[start_idx:]:
                     is_ai_msg = isinstance(msg, AIMessage) or getattr(msg, "type", "") == "ai"
                     
                     if is_ai_msg:
-                        # Cek apakah pesan ini memanggil tool?
                         has_tools = bool(getattr(msg, "tool_calls", []))
                         
-                        # KITA HANYA PEDULI PADA PESAN YANG *TIDAK* MEMANGGIL TOOL
-                        # Karena ini adalah pesan yang ditujukan langsung ke User
                         if not has_tools:
                             isi_teks = str(getattr(msg, "content", "") or "").strip()
-                            kwargs = getattr(msg, "additional_kwargs", {})
-                            #teks_pemikiran = str(kwargs.get("reasoning_content", "") or "").strip()
                             
-                            blok_teks = []
-                            #if teks_pemikiran:
-                            #    blok_teks.append(f"> 🧠 **Pemikiran AI:**\n> {teks_pemikiran}")
+                            # Abaikan jika ini adalah pesan error failsafe TETAPI sudah ada jawaban AI yang valid sebelumnya
+                            is_failsafe_msg = "kesulitan menyelesaikan pemeriksaan ini secara otomatis" in isi_teks
+                            if is_failsafe_msg and len(kumpulan_kesimpulan) > 0:
+                                continue
+
                             if isi_teks:
-                                blok_teks.append(isi_teks)
-                                
-                            teks_gabungan = "\n\n".join(blok_teks)
-                            if teks_gabungan:
-                                kumpulan_kesimpulan.append(teks_gabungan)
-                                #kumpulan_kesimpulan.append("")
+                                kumpulan_kesimpulan.append(isi_teks)
                 
-                # 3. Logika UI Terakhir
+                # 3. Ambil jawaban terbaik/terakhir dari kesimpulan yang valid
                 if kumpulan_kesimpulan:
-                    # AMBIL HANYA KESIMPULAN YANG PALING AKHIR [-1]
                     jawaban_final = kumpulan_kesimpulan[-1]
 
         return {
