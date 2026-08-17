@@ -13,17 +13,10 @@ class ToolRegistry:
 
     # --- TAMBAHAN UNTUK TOOL-RAG (GORILLA STYLE) ---
     _chroma_client = chromadb.PersistentClient(path="./chroma_db_nirina")
-    _embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+    _embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="paraphrase-multilingual-MiniLM-L12-v2")
     _collection = _chroma_client.get_or_create_collection(name="tool_library", embedding_function=_embed_fn)
 
-    # [BARU] Tool yang WAJIB selalu ikut ke LLM apapun hasil semantic search-nya
-    # (kontrol-alur orkestrasi, bukan tool "task" -- jadi similarity-nya ke
-    # deskripsi task user seringkali rendah padahal harus tetap tersedia tiap
-    # giliran, mis. tools_reward/tools_gagal/tools_batal utk nutup skill trace,
-    # atau delegasi_koder/konsultasi_planner/tulis_file yg didaftarkan dari
-    # agent_factory.py saat startup). Sengaja dibuat mutable + method extend
-    # supaya plugin/agent_factory bisa nambah tanpa perlu edit file ini lagi.
-    _tools_wajib_selalu = {"tools_reward", "tools_gagal", "tools_batal"}
+    _tools_wajib_selalu = {"tools_reward", "tools_gagal", "tools_batal", "lupakan_skill_gagal"}
     # -----------------------------------------------
 
     @classmethod
@@ -102,20 +95,33 @@ class ToolRegistry:
         return set(re.findall(r"[a-z0-9]+", (teks or "").lower()))
 
     @classmethod
+    def _hitung_df_token_nama(cls, all_tools) -> dict:
+        """
+        Document frequency token -> di berapa BANYAK nama tool token itu
+        muncul. Dipakai buat bedain kata GENERIK (mis. "buat", "scan", "file" --
+        nongol di banyak nama tool sekaligus) vs kata SPESIFIK/LANGKA (mis.
+        "openrouter", "baca", "wapiti" -- cuma milik 1 tool doang). Ini yang
+        bikin exact-match "adil": exact-match ke kata generik TIDAK dianggap
+        sekuat exact-match ke kata yang benar-benar unik.
+        """
+        df = defaultdict(int)
+        for t in all_tools:
+            for tok in cls._tokenize(t.name):
+                df[tok] += 1
+        return df
+
+    @classmethod
     def _skor_lexical(cls, query_tokens: set, tool) -> float:
-        """[BARU] Skor keyword/lexical sederhana (token overlap, bukan BM25 penuh --
+        """Skor keyword/lexical sederhana (token overlap, bukan BM25 penuh --
         sengaja tanpa dependency tambahan) antara query & (nama+deskripsi) tool.
 
         KENAPA PERLU, PADAHAL SUDAH ADA SEMANTIC SEARCH:
         Embedding model kecil (all-MiniLM-L6-v2) bagus buat kemiripan MAKNA umum,
-        tapi sering false-negative untuk istilah teknis SPESIFIK di tools pentest --
-        mis. query "scan port 8080 pake nmap" vs tool bernama "eksekusi_cmd_windows"
-        bisa punya cosine similarity tinggi (sama-sama "eksekusi teknis") padahal
-        tool yang BENAR (mis. "nmap_scan") justru kalah similarity-nya kalau
-        deskripsinya ditulis kurang deskriptif. Exact match token "nmap" di nama
-        tool adalah sinyal kuat yang sering dilewatkan murni oleh semantic search.
-        Skor dinormalisasi ke overlap/len(query_tokens) supaya query panjang tidak
-        otomatis unggul dibanding query pendek yang presisi.
+        tapi sering false-negative untuk istilah teknis SPESIFIK. Skor
+        dinormalisasi ke overlap/len(query_tokens) supaya query panjang tidak
+        otomatis unggul dibanding query pendek yang presisi. Dipakai HANYA untuk
+        ranking "lemah"/tambahan -- klasifikasi kuat/lemah exact-match sendiri
+        pakai `_klasifikasi_exact_match` di bawah, bukan skor ini.
         """
         if not query_tokens:
             return 0.0
@@ -125,43 +131,80 @@ class ToolRegistry:
         overlap = query_tokens & tool_tokens
         if not overlap:
             return 0.0
-        # Bonus kalau overlap-nya ada di NAMA tool (bukan cuma deskripsi) --
-        # exact match nama tool (mis. "nmap" nyantol ke "nmap_scan") jauh lebih
-        # kuat sebagai sinyal daripada nyantol di kalimat deskripsi yang panjang.
         nama_tokens = cls._tokenize(tool.name)
         bonus_nama = 0.5 if (query_tokens & nama_tokens) else 0.0
         return (len(overlap) / len(query_tokens)) + bonus_nama
 
     @classmethod
+    def _klasifikasi_exact_match(cls, query_tokens: set, tool, df_token: dict, ambang_df: int = 1,
+                                  ambang_cakupan: float = 0.66):
+        """Klasifikasikan exact-name-match tool ini jadi "kuat" atau "lemah".
+
+        KUAT (dijamin masuk, TIDAK dibatasi top_k -- mirip _tools_wajib_selalu) kalau:
+          (a) ADA token overlap yang df-nya <= ambang_df (kata itu cuma dipunyai
+              ambang_df nama tool atau kurang -- default 1, artinya BENAR-BENAR
+              unik milik tool ini), ATAU
+          (b) cakupan overlap terhadap SELURUH token nama tool >= ambang_cakupan
+              (mayoritas kata di nama tool itu ada di query, meski masing-masing
+              kata sendirian generik -- mis. query bilang "scan port nmap" persis
+              menutupi ke-3 kata nama tool "scan_port_nmap").
+
+        LEMAH (exact-match tetap tercatat, tapi tunduk ke kompetisi RRF biasa
+        dan bisa ke-drop kalau slot penuh) kalau overlap ADA tapi TIDAK memenuhi
+        (a) maupun (b) -- biasanya cuma nyantol 1 kata generik doang, mis. "buat"
+        yang dipunyai banyak tool sekaligus (buat_exploit, buat_sqli_exploit).
+
+        Return: "kuat" | "lemah" | None (None = tidak exact-match sama sekali).
+        """
+        nama_tokens = cls._tokenize(tool.name)
+        overlap_nama = query_tokens & nama_tokens
+        
+        if not overlap_nama:
+            return None
+            
+        # 1. Syarat Cakupan Mayoritas (Sangat ketat, 80% token nama tool harus ada di kueri)
+        cakupan = len(overlap_nama) / len(nama_tokens) if nama_tokens else 0
+        if cakupan >= ambang_cakupan:
+            return "kuat"
+            
+        # 2. Syarat Token Unik (Diperketat!)
+        # Token harus unik (df <= ambang_df) DAN memiliki panjang lebih dari 3 huruf (mencegah "di", "ke")
+        token_unik_valid = [tok for tok in overlap_nama if df_token.get(tok, 0) <= ambang_df and len(tok) > 3]
+        
+        if token_unik_valid:
+            # Jika nama tool pendek (1-2 kata), 1 token unik panjang sudah cukup untuk jadi bukti kuat
+            if len(nama_tokens) <= 2:
+                return "kuat"
+            # Jika nama tool panjang (3 kata atau lebih), butuh setidaknya 2 token overlap agar tidak salah tangkap
+            elif len(overlap_nama) >= 2:
+                return "kuat"
+                
+        # Jika gagal melewati syarat ketat di atas, turunkan kasta menjadi "lemah"
+        return "lemah"
+
+    @classmethod
     def get_relevant_tools(cls, task_query: str, top_k: int = 3, bobot_semantic: float = 0.65):
-        """[HYBRID] Filter dinamis tool sebagai input LLM -- gabungan semantic
+        """[HYBRID] Filter dinamis tool untuk disuapkan ke LLM -- gabungan semantic
         search (ChromaDB embedding, nangkep kemiripan MAKNA) + lexical/keyword
         exact-match (nangkep istilah teknis SPESIFIK yang sering dilewatkan
-        embedding model kecil), digabung lewat 2 lapis:
+        embedding model kecil), digabung lewat 3 lapis:
 
-        Layer 1 -- PROMOSI KERAS untuk EXACT-NAME MATCH: kalau ada token di
-        query yang match PERSIS ke token di NAMA tool (mis. "nmap" di query vs
-        tool "nmap_scan"), tool itu dijamin masuk prioritas TERATAS, TIDAK
-        digantungkan ke bobot_semantic. Ini WAJIB dibuat promosi keras, bukan
-        cuma penjumlahan skor tertimbang -- soalnya kalau exact-match cuma jadi
-        salah satu kontributor skor RRF, dan bobot_semantic > 0.5 (default di
-        sini 0.65), tool yang menang telak di semantic-tapi-salah-arah akan
-        SELALU mengalahkan exact-match di lexical (sudah dibuktikan lewat test:
-        query "scan pakai nmap" vs tool "eksekusi_cmd_windows" menang duluan di
-        semantic rank-0, ngalahin "nmap_scan" yang exact-match namanya, kalau
-        cuma dijumlah-tertimbang). Makanya exact-name match harus dipromosikan
-        DI LUAR skema pembobotan itu.
+        LAPIS 1 -- PROMOSI KERAS untuk EXACT-MATCH "KUAT" (lihat
+        `_klasifikasi_exact_match`): tool yang exact-match ke kata UNIK/langka
+        (bukan kata generik yang dipunyai banyak tool sekaligus) dijamin masuk,
+        TIDAK dibatasi top_k sama sekali -- persis kayak `_tools_wajib_selalu`.
 
         Layer 2 -- RECIPROCAL RANK FUSION (RRF) untuk sisa slot: menggabungkan
-        ranking semantic & lexical (overlap nama+deskripsi, bukan cuma exact-
-        name) berdasarkan URUTAN posisi, bukan nilai skor mentah -- supaya aman
+        ranking semantic & lexical (overlap nama+deskripsi, termasuk exact-match
+        LEMAH) berdasarkan URUTAN posisi, bukan nilai skor mentah -- supaya aman
         walau distance metric ChromaDB di collection ini bukan cosine (lihat
         catatan di `_collection` -- tidak diset `hnsw:space: cosine` seperti di
-        skill_lib.py, jadi nilai distance mentahnya TIDAK bisa langsung
-        diperlakukan sebagai "1 - similarity"). K_RRF dipakai kecil (bukan 60
-        seperti standar literatur buat web-search skala ribuan dokumen) --
-        candidate pool kita cuma belasan/puluhan tool, K besar bikin selisih
-        antar-rank nyaris rata dan kehilangan daya beda di pool sekecil ini.
+        skill_lib.py). K_RRF dipakai kecil (bukan 60 seperti standar literatur
+        buat web-search skala ribuan dokumen) -- candidate pool kita cuma
+        belasan/puluhan tool, K besar bikin selisih antar-rank nyaris rata.
+
+        Layer 3 -- Tool wajib (`_tools_wajib_selalu`) tetap dipaksa masuk paling
+        akhir seperti sebelumnya, tidak berubah.
         """
         all_public_tools = cls.get_all_tools()
 
@@ -172,15 +215,22 @@ class ToolRegistry:
         tools_by_name = {t.name: t for t in all_public_tools}
         query_tokens = cls._tokenize(task_query)
 
-        # --- LAPIS 1: EXACT-NAME MATCH (promosi keras) ---
-        nama_exact_match = {t.name for t in all_public_tools if query_tokens & cls._tokenize(t.name)}
+        # --- LAPIS 1: KLASIFIKASI EXACT-MATCH KUAT vs LEMAH ---
+        df_token = cls._hitung_df_token_nama(all_public_tools)
+        nama_exact_kuat, nama_exact_lemah = set(), set()
+        for t in all_public_tools:
+            klasifikasi = cls._klasifikasi_exact_match(query_tokens, t, df_token)
+            if klasifikasi == "kuat":
+                nama_exact_kuat.add(t.name)
+            elif klasifikasi == "lemah":
+                nama_exact_lemah.add(t.name)
 
         # --- Semantic ranking (urutan dari ChromaDB, bukan nilai distance mentahnya) ---
         jumlah_kandidat_semantic = min(top_k * 4, len(all_public_tools))
         hasil = cls._collection.query(query_texts=[task_query], n_results=jumlah_kandidat_semantic)
         ranking_semantic = (hasil.get('ids') or [[]])[0]
 
-        # --- Lexical ranking (overlap nama+deskripsi, superset dari exact-name match) ---
+        # --- Lexical ranking (overlap nama+deskripsi, superset dari exact-match) ---
         skor_lexical_semua = [
             (t.name, cls._skor_lexical(query_tokens, t)) for t in all_public_tools
         ]
@@ -189,28 +239,33 @@ class ToolRegistry:
             if skor > 0
         ]
 
-        # --- LAPIS 2: RRF untuk sisa slot ---
+        # --- LAPIS 2: RRF untuk sisa slot (di luar exact-match KUAT) ---
         K_RRF = 5
         skor_rrf = defaultdict(float)
         for rank, nama in enumerate(ranking_semantic):
             skor_rrf[nama] += bobot_semantic * (1.0 / (K_RRF + rank + 1))
         for rank, nama in enumerate(ranking_lexical):
             skor_rrf[nama] += (1 - bobot_semantic) * (1.0 / (K_RRF + rank + 1))
-
         terurut = sorted(skor_rrf.items(), key=lambda kv: kv[1], reverse=True)
-        # Promosikan exact-name match ke depan antrian (diurutkan sesama mereka
-        # pakai skor RRF-nya juga, bukan asal urutan set), baru isi sisa slot
-        # dari hasil RRF biasa.
-        terurut_prioritas = (
-            [(nama, skor) for nama, skor in terurut if nama in nama_exact_match]
-            + [(nama, skor) for nama, skor in terurut if nama not in nama_exact_match]
-        )
-        tools_terpilih = [
-            tools_by_name[nama] for nama, _ in terurut_prioritas[:top_k] if nama in tools_by_name
-        ]
+
+        # --- GABUNGKAN: KUAT dulu (TANPA batas top_k), baru isi sisa slot dari RRF ---
+        tools_terpilih = []
+        nama_terpilih = set()
+        for nama in sorted(nama_exact_kuat, key=lambda n: skor_rrf.get(n, 0.0), reverse=True):
+            if nama in tools_by_name and nama not in nama_terpilih:
+                tools_terpilih.append(tools_by_name[nama])
+                nama_terpilih.add(nama)
+        for nama, _ in terurut:
+            if len(tools_terpilih) >= top_k:
+                break
+            if nama in nama_terpilih or nama not in tools_by_name:
+                continue
+            tools_terpilih.append(tools_by_name[nama])
+            nama_terpilih.add(nama)
 
         print(
-            f"\n[🦍 Tool-RAG Hybrid] exact_match={sorted(nama_exact_match)} | "
+            f"\n[🦍 Tool-RAG Hybrid] exact_kuat={sorted(nama_exact_kuat)} | "
+            f"exact_lemah={sorted(nama_exact_lemah)} | "
             f"semantic_top={ranking_semantic[:top_k]} | lexical_top={ranking_lexical[:top_k]} | "
             f"terpilih={[t.name for t in tools_terpilih]}"
         )
@@ -381,6 +436,22 @@ class SmokeTestRegistry:
     (argumen kurang, API ketuker, dsb) dan itu cuma ketahuan begitu benar-benar
     dieksekusi.
  
+    Kontributor daftar smoke test PER NAMA FILE (bukan per tool) di file
+    plugin masing-masing:
+ 
+        from core_agent.registry import SmokeTestRegistry
+ 
+        @SmokeTestRegistry.register("sqllogin.py")
+        def tes_sqllogin(modul):
+            # `modul` = module Python hasil importlib.reload() dari file yang
+            # BARU ditulis (belum permanen -- tulis_file akan rollback kalau
+            # test ini gagal). Lempar Exception/assert apapun kalau gagal.
+            hasil = modul.verifikasi_login("admin", "rahasia123")
+            assert "LOGIN_SUKSES" in hasil, f"Login normal harus tetap sukses: {hasil}"
+ 
+    Kalau tidak ada test terdaftar untuk sebuah file, tulis_file tetap jalan
+    normal tanpa validasi tambahan (opt-in per file, tidak mengubah perilaku
+    file yang belum ada test-nya).
     """
     _tests = {}
  

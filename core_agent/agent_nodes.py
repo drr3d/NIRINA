@@ -1,7 +1,8 @@
 import operator
 import json
 import hashlib
-from typing import Annotated, TypedDict, Any
+import random
+from typing import Annotated, TypedDict, Any, Optional
 
 # Import LangChain & LangGraph components
 from langchain_core.prompts import ChatPromptTemplate
@@ -9,7 +10,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, RemoveMessage
 from langgraph.graph.message import add_messages
 
 # ==========================================
-# --- [BARU] HELPER: SIGNATURE TOOL CALL ---
+# --- HELPER: SIGNATURE TOOL CALL ---
 # ==========================================
 def _signature_tool_calls(tool_calls: list) -> str:
     """
@@ -45,6 +46,11 @@ def buat_ringkasan_memori(pesan_lama: list, fast_llm: Any, ringkasan_sebelumnya:
     """Menggunakan LLM sekunder yang cepat untuk meringkas obrolan usang."""
     teks_obrolan = ""
     for p in pesan_lama:
+        # [FIX] Sebelumnya cuma bedain "User" (HumanMessage) vs "AI" (semua yang
+        # lain) -- ToolMessage ikut kelabel "AI", padahal isinya hasil tool
+        # (mis. output ZAP/SQLMap), bukan omongan AI. Sekarang dilabel eksplisit
+        # pakai nama tool-nya supaya fast_llm tahu ini data mentah dari tool,
+        # bukan narasi AI, dan bisa meringkasnya secara akurat.
         if p.type == "human":
             peran = "User"
         elif p.type == "tool":
@@ -159,7 +165,7 @@ def optimasi_konteks_langchain(
         # [FIX] Cek ambang pakai akumulasi SEBELUM pesan ini ditambahkan.
         long_context_inturn = not is_giliran_selesai and (
             (total_msgs - idx) > BATAS_PESAN_AMAN_DALAM_GILIRAN
-            or akumulasi_karakter_inturn > BATAS_KARAKTER_AMAN_DALAM_GILIRAN  # [BARU]
+            or akumulasi_karakter_inturn > BATAS_KARAKTER_AMAN_DALAM_GILIRAN 
         )
 
         if not is_giliran_selesai:
@@ -177,7 +183,6 @@ def optimasi_konteks_langchain(
             )
 
             if harus_dikompres:
-                # [BARU] Numpang ke pipeline ringkasan yang SUDAH ADA
                 if fast_llm:
                     pesan_untuk_diringkas.append(msg)
                     status_ringkas = "sudah diringkas ke ingatan jangka panjang (lihat pesan '--- INGATAN JANGKA PANJANG AI ---' di atas)"
@@ -216,11 +221,7 @@ def optimasi_konteks_langchain(
                     # LangChain butuh pesan ini untuk validasi pasangan ToolMessage.
                     if fast_llm:
                         pesan_untuk_diringkas.append(msg)
-                    # [BARU] Kompresi ARGUMEN tool_calls kalau kepanjangan -- ini
-                    # operasi LOKAL (cuma json.dumps + potong string), BUKAN panggilan
-                    # LLM, jadi sengaja TIDAK digantungkan ke `fast_llm` sama sekali.
-                    # Tanpa ini, setup yang belum wire fast_llm (mis. enable_optimization=True
-                    # tapi fast_llm=None) tidak akan pernah dapat manfaat kompresi args ini.
+
                     if _panjang_args_tool_calls(msg.tool_calls) > PANJANG_MIN_UNTUK_KOMPRESI:
                         cleaned_messages.append(AIMessage(
                             content=msg.content,
@@ -289,14 +290,15 @@ class AgentState(TypedDict):
     revision_count: Annotated[int, operator.add]
     pending_tasks: str # <-- Tambahan baru, untuk monitoring pending task
     summary: str # <-- TAMBAHAN BARU: Wadah untuk ringkasan
-    # --- [BARU] Guard pengulangan tool call (lihat _signature_tool_calls di atas) ---
+    # --- Guard pengulangan tool call (lihat _signature_tool_calls di atas) ---
     last_tool_signature: str  # hash nama+args tool call terakhir (utk deteksi ulang persis)
     last_tool_names: str      # versi manusiawi (nama tool doang) buat reminder/log
     tool_repeat_count: Annotated[int, operator.add]  # berapa kali berturut-turut identik
 
-     # --- [BARU] Skill Library (Voyager-style) ---
+     # ---Skill Library (Voyager-style) ---
     current_task_desc: str                              # diisi user saat kasih task baru (dipotong [:300], khusus skill library)
-    current_task_desc_full: str                          # [BARU] versi UTUH (tidak dipotong), khusus query Tool-RAG
+    current_task_desc_full: str                          # versi UTUH (tidak dipotong), khusus query Tool-RAG
+    mode_eksplorasi: Optional[bool]                       # diputuskan SEKALI di awal task -- True = referensi skill sukses SENGAJA disembunyikan (dorong eksplorasi jalur baru)
     current_skill_trace: Annotated[list,  replace_atau_tambah]   # numpuk selama task berjalan
 # ==========================================
 # --- 2. DEFINISI NODE (KOMPONEN AI) ---
@@ -320,9 +322,14 @@ class AIBrainProcessor:
         skill_library: Any = None,   # <-- BARU: instance SkillLibrary, opsional
         top_k_skill: int = 3,
 
-        # --- [BARU] GORILLA-STYLE DYNAMIC TOOL RETRIEVAL ---
+        maks_umur_skill_gagal_detik: Optional[float] = 2 * 24 * 3600,
+
+        min_similarity_skill_sukses: float = 0.80,
+        min_similarity_skill_gagal: float = 0.65,
+
+        # --- GORILLA-STYLE DYNAMIC TOOL RETRIEVAL ---
         tool_registry: Any = None,   # <-- instance/class ToolRegistry, opsional
-        top_k_tools: int = 4,
+        top_k_tools: int = 8,
     ):
         """
         batas_karakter_inturn: ambang katup-ukuran di optimasi_konteks_langchain
@@ -346,19 +353,13 @@ class AIBrainProcessor:
         self.base_prompt = base_prompt
         self.fast_llm = fast_llm
 
-        # --- [BARU] GORILLA-STYLE DYNAMIC TOOL RETRIEVAL ---
+        # --- GORILLA-STYLE DYNAMIC TOOL RETRIEVAL ---
         self.tool_registry = tool_registry
         self.top_k_tools = top_k_tools
-        self._tools_fallback = tools_list  # dipakai kalau tool_registry None ATAU query kosong
+        self._tools_fallback = tools_list  # dipakai kalau Tool-RAG nonaktif ATAU query kosong
+        self._llm_mentah = llm_model
 
-        if tool_registry is None:
-            self._dynamic_tools = False
-            self._llm_with_tools = llm_model.bind_tools(tools_list)
-            self._llm_mentah = None
-        else:
-            self._dynamic_tools = True
-            self._llm_with_tools = None
-            self._llm_mentah = llm_model
+        self.gorilla_aktif = (tool_registry is not None)
         self.enable_optimization = enable_optimization # <-- SAKELAR TOGGLE
         self.batas_pesan_inturn = batas_pesan_inturn
         self.batas_karakter_inturn = batas_karakter_inturn
@@ -366,6 +367,29 @@ class AIBrainProcessor:
 
         self.skill_library = skill_library
         self.top_k_skill = top_k_skill
+        self.maks_umur_skill_gagal_detik = maks_umur_skill_gagal_detik
+        self.min_similarity_skill_sukses = min_similarity_skill_sukses
+        self.min_similarity_skill_gagal = min_similarity_skill_gagal
+
+    def set_gorilla_tool_rag(self, aktif: bool) -> str:
+        """
+        Nyalakan/matikan mekanisme Tool-RAG Gorilla-style secara
+        RUNTIME (tanpa restart proses) -- dipanggil dari tool kontrol
+        `atur_gorilla_tool_rag` (lihat plugin_atur_gorilla_tool_rag.py) yang
+        bisa di-trigger langsung dari chat user. Berlaku mulai giliran
+        BERIKUTNYA (giliran yang sedang berjalan saat tool ini dipanggil
+        sudah terlanjur pakai keputusan lama).
+        """
+        if self.tool_registry is None:
+            return (
+                "Tool-RAG Gorilla tidak tersedia di deployment ini -- "
+                "tool_registry tidak di-set saat AIBrainProcessor dibuat "
+                "(lihat agent_factory.py), jadi tidak ada yang bisa dinyalakan."
+            )
+        self.gorilla_aktif = bool(aktif)
+        status = "DIAKTIFKAN" if self.gorilla_aktif else "DINONAKTIFKAN"
+        print(f"\n[⚙️ Runtime Toggle] Tool-RAG Gorilla {status} lewat perintah chat.")
+        return f"Tool-RAG Gorilla berhasil {status}. Berlaku mulai giliran berikutnya."
 
     def _build_pending_reminder(self, pending_tasks: str) -> SystemMessage:
         """
@@ -388,15 +412,7 @@ class AIBrainProcessor:
         )
 
     def _build_retry_reminder(self, percobaan_ke: int) -> SystemMessage:
-        """
-        [FIX: BUG THINKING+TOOLS QWEN3.5] Dipakai saat giliran SEBELUMNYA balik
-        dengan content kosong DAN tanpa tool_calls (indikasi bug renderer Ollama
-        pada model thinking saat dikombinasikan dengan tool-calling -- lihat
-        catatan di agent_router.py). Sama seperti _build_pending_reminder, pesan
-        ini HANYA ditempel di ekor list untuk invoke() saat ini saja -- TIDAK
-        ikut disimpan ke state/checkpointer -- supaya messages[0] (system prompt)
-        tetap identik & KV-cache tetap kepakai.
-        """
+
         return HumanMessage(
             content=(
                 f"[⚠️ PERINGATAN SISTEM: Respons kamu di giliran sebelumnya KOSONG "
@@ -415,7 +431,7 @@ class AIBrainProcessor:
 
     def _build_tool_repeat_reminder(self, nama_tools: str, jumlah: int) -> SystemMessage:
         """
-        [BARU] Ditempel di ekor list HANYA untuk invoke() saat ini (tidak ikut
+        Ditempel di ekor list HANYA untuk invoke() saat ini (tidak ikut
         disimpan ke state/checkpointer) kalau giliran SEBELUMNYA terdeteksi
         memanggil tool (nama+args) yang PERSIS SAMA berturut-turut. Tujuannya
         kasih kesempatan model "sadar" dan berhenti sendiri sebelum
@@ -458,11 +474,6 @@ class AIBrainProcessor:
         #messages = list(state.get("messages", []))
         messages_raw = list(state.get("messages", []))
 
-        # =======================================================
-        # 🐛 TRY FIX OLLAMA ERROR 400: Hapus pesan AI yang 'gagal' 
-        # =======================================================
-        # Cegah penumpukan pesan asisten berturut-turut di akhir list 
-        # akibat loop retry dari DecisionRouter.
         messages = []
         for msg in messages_raw:
             # Jika ini adalah pesan AI, tapi teksnya kosong DAN tidak bawa tool calls, abaikan!
@@ -476,7 +487,6 @@ class AIBrainProcessor:
 
         revision_count = state.get("revision_count", 0) # <-- FIX RETRY KOSONG: hitungan percobaan ulang
 
-        # --- [BARU] Guard pengulangan tool call: baca hitungan dari giliran sebelumnya ---
         tool_repeat_count = state.get("tool_repeat_count", 0)
         last_tool_signature = state.get("last_tool_signature", "")
         last_tool_names = state.get("last_tool_names", "")
@@ -490,8 +500,6 @@ class AIBrainProcessor:
 
         # 2. [TOGGLE MEKANISME OPTIMASI]
         if self.enable_optimization:
-            # 2. Pangkas konteks usang (Memakai fungsi global)
-            # Mode Cerdas: Pangkas konteks usang & Eksekusi Peringkas
             messages_dioptimalkan, ringkasan_baru = optimasi_konteks_langchain(
                 messages, current_summary, self.fast_llm,
                 batas_pesan_inturn=self.batas_pesan_inturn,
@@ -504,21 +512,12 @@ class AIBrainProcessor:
             messages_dioptimalkan = messages
             ringkasan_baru = current_summary
 
-        # 3. [OPTIMASI KV-CACHE] Reminder pending_tasks (kalau ada) ditempel di EKOR list,
-        # cuma untuk panggilan invoke() ini -- tidak ikut ke-return/ke-simpan ke state.
         if pending_tasks:
             messages_dioptimalkan = messages_dioptimalkan + [self._build_pending_reminder(pending_tasks)]
 
-        # 3b. [FIX RETRY KOSONG] Kalau ini hasil loop-back dari router karena giliran
-        # sebelumnya kosong, tempel reminder ekstra biar model tidak mengulang kesalahan
-        # yang sama. Sama seperti reminder lain: cuma untuk invoke() ini, tidak disimpan.
         if revision_count > 0:
             messages_dioptimalkan = messages_dioptimalkan + [self._build_retry_reminder(revision_count)]
 
-        # 3c. [BARU] Kalau giliran SEBELUMNYA mengulang tool yang PERSIS SAMA,
-        # tempel reminder ekstra di ekor list (hanya utk invoke() ini, tidak
-        # disimpan ke state) supaya model dikasih kesempatan berhenti sendiri
-        # sebelum DecisionRouter menjatuhkan hard-stop di MAX_TOOL_REPEAT.
         if tool_repeat_count > 0 and last_tool_names:
             messages_dioptimalkan = messages_dioptimalkan + [
                 self._build_tool_repeat_reminder(last_tool_names, tool_repeat_count)
@@ -527,14 +526,14 @@ class AIBrainProcessor:
         current_task_desc = state.get("current_task_desc", "")
         current_task_desc_full = state.get("current_task_desc_full", "")
         current_skill_trace = state.get("current_skill_trace", [])
+        mode_eksplorasi_tersimpan = state.get("mode_eksplorasi", None)
 
         task_desc_baru = None
 
+        # current_task_desc yang tetap dipotong buat skill library.
         human_msg_lengkap_untuk_rag = None
         if not current_skill_trace:  # <-- UBAH KONDISI DI SINI:
-            # FIX: HANYA ambil jika pesan paling ujung benar-benar dari User.
-            # Ini mencegah prompt "panggil tools_reward" terekam sebagai tugas baru 
-            # saat AI sedang memproses ToolMessage di putaran (turn) berikutnya.
+
             if messages_raw and messages_raw[-1].type == "human":
                 pesan_human_terbaru = messages_raw[-1]
                 if pesan_human_terbaru.content.strip():
@@ -543,17 +542,20 @@ class AIBrainProcessor:
                     human_msg_lengkap_untuk_rag = pesan_human_terbaru.content.strip()
                     current_task_desc_full = human_msg_lengkap_untuk_rag
 
-        # --- [BARU] Retrieval skill relevan (Sukses & Gagal) ---
+        mode_eksplorasi_aktif = False
+        mode_eksplorasi_baru_diputuskan = False
         if self.skill_library and current_task_desc:
             print(f"\n [Orchestrator] Agent mencari relevan skill dari pembelajaran...")
-            # 1. Tarik top skills yang berhasil (Top-K)
+
             skills_sukses = self.skill_library.cari_skill_relevan(
-                current_task_desc, top_k=self.top_k_skill, status_filter="berhasil"
+                current_task_desc, top_k=self.top_k_skill, status_filter="berhasil",
+                min_similarity=self.min_similarity_skill_sukses,
             )
             
-            # 2. Tarik skill yang gagal sebagai anti-pattern (cukup Top-1 saja agar prompt tidak membengkak)
             skills_gagal = self.skill_library.cari_skill_relevan(
-                current_task_desc, top_k=1, status_filter="gagal"
+                current_task_desc, top_k=1, status_filter="gagal",
+                maks_umur_detik=self.maks_umur_skill_gagal_detik,
+                min_similarity=self.min_similarity_skill_gagal,
             )
 
             if skills_sukses:
@@ -561,13 +563,60 @@ class AIBrainProcessor:
 
             if skills_gagal:
                 print(f"\n [Orchestrator] didapatkan skill gagal: {skills_gagal}")
+
+            AMBANG_SIMILARITY_TINGGI = 0.85   # skor>=90 HARUS dibarengi similarity setinggi ini baru 0% eksplorasi
+            AMBANG_SIMILARITY_RENDAH = 0.75   # di bawah ini, similarity terlalu lemah -> WAJIB eksplorasi apapun skor-nya
+
+            def _probabilitas_untuk_skill(s: dict) -> float:
+                skor = s.get("skor", 0)
+                sim = s.get("similarity", 0)
+                if skor < 85 or sim < AMBANG_SIMILARITY_RENDAH:
+                    return 1.0
+                if skor >= 90 and sim >= AMBANG_SIMILARITY_TINGGI:
+                    return 0.0
+                return 0.5
+
+            if mode_eksplorasi_tersimpan is not None:
+                # Sudah pernah diputuskan sebelumnya di task ini -- pakai apa adanya,
+                # JANGAN di-roll ulang (biar konsisten sepanjang task).
+                mode_eksplorasi_aktif = mode_eksplorasi_tersimpan
+            elif skills_sukses:
+                probabilitas_per_skill = [
+                    (s["deskripsi"][:50], s.get("skor", 0), s.get("similarity", 0), _probabilitas_untuk_skill(s))
+                    for s in skills_sukses
+                ]
+                probabilitas_eksplorasi = min(p for *_, p in probabilitas_per_skill)
+
+                mode_eksplorasi_aktif = random.random() < probabilitas_eksplorasi
+                mode_eksplorasi_baru_diputuskan = True
+
+                print(
+                    f"\n[🎲 Mode Eksplorasi] Evaluasi per-skill (deskripsi|skor|similarity|probabilitas): "
+                    f"{probabilitas_per_skill} -> probabilitas akhir (ambil paling percaya diri) "
+                    f"{probabilitas_eksplorasi*100:.0f}% -> "
+                    f"{'EKSPLORASI (skill sukses disembunyikan)' if mode_eksplorasi_aktif else 'eksploitasi normal (skill sukses ditampilkan)'}"
+                )
+
+            if mode_eksplorasi_aktif:
+                skills_sukses = []
+
             # 3. Format keduanya ke dalam satu prompt sistem
             teks_skill = self.skill_library.format_untuk_prompt(skills_sukses, skills_gagal)
             
             if teks_skill:
                 messages_dioptimalkan = messages_dioptimalkan + [HumanMessage(content=f"[INFO SISTEM]\n{teks_skill}")]
-                # Catatan: sisip di EKOR, sama seperti reminder lain -- TIDAK disimpan ke
-                # state/checkpointer, supaya messages[0] tetap stabil buat KV-cache.
+
+                messages_dioptimalkan = messages_dioptimalkan + [
+                    HumanMessage(content=(
+                        "[PENGINGAT PRIORITAS]\n"
+                        "Blok skill library di atas HANYALAH latar belakang historis, "
+                        "BUKAN instruksi untuk sekarang. Yang WAJIB kamu ikuti adalah "
+                        "instruksi eksplisit dari pesan user SEBELUMNYA di percakapan "
+                        "ini -- kalau urutan langkah atau tool yang diminta user berbeda "
+                        "dari referensi skill library, ABAIKAN referensi itu sepenuhnya "
+                        "dan ikuti instruksi user apa adanya."
+                    ))
+                ]
         
         # ==========================================
         # 🛡️ Safety Net to handle: 
@@ -582,10 +631,10 @@ class AIBrainProcessor:
             )
         # ==========================================
 
-        # --- [BARU] 3d. GORILLA-STYLE DYNAMIC TOOL RETRIEVAL ---
+        # --- 3d. GORILLA-STYLE DYNAMIC TOOL RETRIEVAL ---
         # Dipanggil TEPAT SEBELUM invoke() -- bukan di step lain -- supaya query
         # RAG-nya sedekat mungkin dengan kondisi TERKINI.
-        if self._dynamic_tools:
+        if self.tool_registry is not None and self.gorilla_aktif:
             basis_query = current_task_desc_full or current_task_desc
             konteks_terkini = ""
             if current_skill_trace:  # <-- baru diperkaya kalau memang sudah mid-task
@@ -609,7 +658,7 @@ class AIBrainProcessor:
             )
             llm_untuk_invoke = self._llm_mentah.bind_tools(tools_relevan)
         else:
-            llm_untuk_invoke = self._llm_with_tools
+            llm_untuk_invoke = self._llm_mentah.bind_tools(self._tools_fallback)
 
         print("\n[Log Sistem] AI Utama sedang menganalisis input atau menyusun jawaban...")
         
@@ -662,7 +711,7 @@ class AIBrainProcessor:
             "summary": ringkasan_baru 
         }
 
-        # --- [BARU] Rekam tool_calls giliran ini ke jejak skill task aktif ---
+        # --- Rekam tool_calls giliran ini ke jejak skill task aktif ---
         if response.tool_calls:
             trace_entry = [
                 {"name": tc.get("name"), "args": tc.get("args")} for tc in response.tool_calls
@@ -673,23 +722,18 @@ class AIBrainProcessor:
             update_state["current_task_desc"] = task_desc_baru
             update_state["current_task_desc_full"] = human_msg_lengkap_untuk_rag or task_desc_baru
 
-        # 6a. [FIX v2 - RETRY KOSONG] Sebelumnya TIDAK ADA node yang meng-increment
-        # revision_count, jadi guardrail MAX_RETRY_KOSONG di agent_router.py tidak
-        # pernah benar-benar membatasi apapun. Sekarang: kalau respons kosong DAN
-        # tanpa tool_calls, numpuk +1 (reducer operator.add). Begitu respons sukses
-        # (ada teks atau ada tool_calls), reset counter ke 0 supaya tidak "nyangkut"
-        # ke giliran berikutnya yang tidak berhubungan.
+        # Simpan keputusan mode eksplorasi HANYA kalau baru diputuskan turn
+        # ini (lihat blok "MODE EKSPLORASI" di atas) -- supaya tetap konsisten
+        # sepanjang task yang sama, tidak di-roll ulang tiap giliran.
+        if mode_eksplorasi_baru_diputuskan:
+            update_state["mode_eksplorasi"] = mode_eksplorasi_aktif
+
         response_kosong = not response.content.strip() and not getattr(response, "tool_calls", None)
         if response_kosong:
             update_state["revision_count"] = 1
         elif revision_count > 0:
             update_state["revision_count"] = -revision_count  # reset ke 0
 
-        # 6b. [BARU] Guard pengulangan tool call: bandingkan signature tool_calls
-        # giliran INI dengan signature giliran SEBELUMNYA (last_tool_signature).
-        # Sama persis -> numpuk tool_repeat_count. Beda / tidak ada tool_calls ->
-        # reset. DecisionRouter (agent_router.py) yang nanti memutuskan hard-stop
-        # kalau tool_repeat_count >= MAX_TOOL_REPEAT.
         if response.tool_calls:
             new_signature = _signature_tool_calls(response.tool_calls)
             new_names = ", ".join(
@@ -713,7 +757,7 @@ class AIBrainProcessor:
             update_state["last_tool_signature"] = ""
             update_state["last_tool_names"] = ""
 
-        # 6c.[BARU] Tangkap sinyal tools_reward / tools_gagal / tools_batal
+        # 6c.Tangkap sinyal tools_reward / tools_gagal / tools_batal
         for tc in (response.tool_calls or []):
             nama_tool = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
             
@@ -723,6 +767,7 @@ class AIBrainProcessor:
                 update_state["current_skill_trace"] = None
                 update_state["current_task_desc"] = ""
                 update_state["current_task_desc_full"] = ""
+                update_state["mode_eksplorasi"] = None
                 continue
                 
             if nama_tool in ("tools_reward", "tools_gagal") and self.skill_library:
@@ -733,6 +778,7 @@ class AIBrainProcessor:
                     update_state["current_skill_trace"] = None
                     update_state["current_task_desc"] = ""
                     update_state["current_task_desc_full"] = ""
+                    update_state["mode_eksplorasi"] = None
                     continue
 
                 args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
@@ -757,6 +803,7 @@ class AIBrainProcessor:
                 update_state["current_skill_trace"] = None
                 update_state["current_task_desc"] = ""
                 update_state["current_task_desc_full"] = ""
+                update_state["mode_eksplorasi"] = None
                 
         # 7. simpan status task
         if response.content:
