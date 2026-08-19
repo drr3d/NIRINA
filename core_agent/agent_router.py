@@ -1,170 +1,317 @@
-from typing import List, Any, Dict, Union
+# ==========================================
+# File: core_agent/agent_router.py
+# ==========================================
+import json
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import List, Any, Dict, Union, Optional
+
+from langchain_core.messages import SystemMessage, HumanMessage
+
 from .agent_nodes import AgentState
+
+# Gunakan Logger standar Python untuk Framework Level
+logger = logging.getLogger("FrameworkRouter")
 
 # ==========================================
 # 🎚️ TOGGLE PARALLEL TOOL CALLING
 # ==========================================
 # False = (Aman untuk RAM/GPU Kecil) AI hanya dieksekusi satu per satu sesuai prioritas.
 # True  = (Butuh Spek Tinggi) Mengaktifkan Fan-out LangGraph. Agen/Node akan berjalan bersamaan.
+# Consider this deprecated
 ENABLE_PARALLEL_ROUTING = False
 
-# ============================================
-# --- 3. DEFINISI ROUTER ---
-# ============================================
-class DecisionRouter:
+# ==========================================
+# 1. DATACLASS KONFIGURASI ROUTER
+# ==========================================
+nofinal_kw = ["akan mencari", "akan memeriksa", "let me check"] # mungkin harus di taro di file config.json
+@dataclass
+class RouterConfig:
+    """Konfigurasi terpusat untuk Router Framework."""
+    enable_parallel: bool = False
+    max_retry_kosong: int = 2
+    max_tool_repeat: int = 3
+    max_percobaan_tanpa_tool: int = 1
+    max_nudge_loop: int = 1
+    min_content_length_substantive: int = 80
+    non_final_keywords: List[str] = field(default_factory=lambda: nofinal_kw)
+    fallback_route: str = "safe"
+    special_routing: Dict[str, str] = field(default_factory=dict)
+    category_priority: List[str] = field(default_factory=list)
+
+
+# ==========================================
+# 2. HELPER UTILITAS ROUTER
+# ==========================================
+def _signature(tc) -> str:
+    """Signature stabil (nama+argumen) buat bandingkan 2 tool_calls."""
+    nama = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
+    args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+    return f"{nama}:{json.dumps(args, sort_keys=True, default=str)}"
+
+
+def _giliran_ini(messages):
+    """Generator: pesan sejak HumanMessage ASLI terakhir, terbaru ke terlama."""
+    for m in reversed(messages):
+        if getattr(m, "type", None) == "human" and not (getattr(m, "content", "") or "").startswith("[SISTEM"):
+            return
+        yield m
+
+
+# ==========================================
+# 3. BASE ABSTRACT ROUTER
+# ==========================================
+class BaseRouter(ABC):
+    """Interface dasar untuk semua Router di dalam Framework."""
+
+    @abstractmethod
+    def __call__(self, state: AgentState) -> Union[str, List[str]]:
+        """Entry point wajib untuk LangGraph Conditional Edge."""
+        pass
+
+
+# ==========================================
+# 4. DECISION ROUTER (MAIN AGENT)
+# ==========================================
+class DecisionRouter(BaseRouter):
     """
-    Router Dinamis untuk Framework LangGraph.
-    Mendukung Parallel Tool Calling dan otomatis mengamankan eksekusi 
-    jika terdapat tool sensitif di antara pemanggilan multi-tool.
+    Router Dinamis untuk Main Agent dengan arsitektur Guardrail Pipeline.
     """
 
-    MAX_RETRY_KOSONG = 2   # maksimal 2x coba ulang respons kosong sebelum menyerah dengan jujur
-    MAX_TOOL_REPEAT = 3    # maksimal 3x panggilan tool identik (nama+args sama) berturut-turut
-
-    # ==========================================
-    # 🕵️‍♂️ INTERCEPT MAP (Tool Shadowing)
-    # Peta nama tool dummy untuk diteruskan ke sub-agent (tanpa merusak Registry)
-    # ==========================================
-    SPECIAL_ROUTING = {
-        "delegasi_koder": "coder",
-        "konsultasi_planner": "planner"
-    }
-
-    def __init__(self, tools_by_category: Dict[str, List[Any]], fallback_route: str = "safe", logger=None):
-        self._logger = logger or print
-        self.fallback_route = fallback_route
+    def __init__(
+        self, 
+        tools_by_category: Dict[str, List[Any]], 
+        config: Optional[RouterConfig] = None,
+        # Untuk backward compatibility jika dipanggil tanpa RouterConfig:
+        fallback_route: str = "safe",
+        special_routing: Optional[Dict[str, str]] = None,
+        category_priority: Optional[List[str]] = None,
+    ):
+        # Inisialisasi Config (bisa via object RouterConfig atau individual args)
+        self.config = config or RouterConfig(
+            fallback_route=fallback_route,
+            special_routing=special_routing or {},
+            category_priority=category_priority or []
+        )
         
-        # Membangun Lookup Table secara dinamis
-        self.tool_to_category = {}
-
+        # Build Lookup Table dinamis
+        self.tool_to_category: Dict[str, str] = {}
         for category, tools in tools_by_category.items():
             for t in tools:
                 nama_tool = getattr(t, 'name', t)
                 self.tool_to_category[nama_tool] = category
 
-    def _tentukan_rute_tool(
-        self,
-        pesan_terakhir,
-        revision_count: int = 0,
-        tool_repeat_count: int = 0,
-    ) -> Union[str, List[str]]:
-        """
-        MEKANISME UTAMA: Dinamis mencari kategori dari semua tool yang dipanggil.
-        """
-        tool_calls = getattr(pesan_terakhir, "tool_calls", [])
-        invalid_calls = getattr(pesan_terakhir, "invalid_tool_calls", [])
-
-        # ==========================================
-        # 🛡️ GUARDRAIL 1: DETEKSI TOOL CACAT (TYPO JSON)
-        # ==========================================
+    # --- PIPELINE GUARDRAILS ---
+    def _check_invalid_json(self, invalid_calls, tool_calls) -> Optional[str]:
         if invalid_calls and not tool_calls:
-            self._logger(f"[Log Router] ❌ AI gagal memformat Tool JSON dengan benar. Memaksa loop balik (retry_kosong)!")
+            logger.warning("[DecisionRouter] ❌ AI gagal memformat Tool JSON -> retry_kosong")
             return "retry_kosong"
+        return None
 
-        daftar_tool_terpanggil = []
-        if tool_calls:
-            # ==========================================
-            # 🔁 GUARDRAIL BARU: DETEKSI TOOL YANG DIULANG TERUS
-            # ==========================================
-            # Dicek SEBELUM logika kategori/prioritas -- kalau tool (nama+args)
-            # yang PERSIS SAMA sudah dipanggil >= MAX_TOOL_REPEAT kali berturut-turut,
-            # paksa berhenti daripada membiarkan AI terus mengulang sampai
-            # recursion_limit LangGraph tercapai (lihat run() di agent_graph.py).
-            if tool_repeat_count >= self.MAX_TOOL_REPEAT:
-                nama_tools_log = ", ".join(
-                    tc.get('name') if isinstance(tc, dict) else getattr(tc, 'name', '')
-                    for tc in tool_calls
-                )
-                self._logger(
-                    f"[Log Router] 🔁 AI mengulang tool [{nama_tools_log}] dengan argumen SAMA "
-                    f"{tool_repeat_count}x berturut-turut -> paksa berhenti (gagal_looping)!"
-                )
-                return "gagal_looping"
+    def _check_tool_loop(self, tool_repeat_count: int, tool_calls: list) -> Optional[str]:
+        if tool_repeat_count >= self.config.max_tool_repeat:
+            nama_tools = ", ".join(tc.get('name') if isinstance(tc, dict) else getattr(tc, 'name', '') for tc in tool_calls)
+            logger.error(f"[DecisionRouter] 🔁 Loop terdeteksi pada tool [{nama_tools}] ({tool_repeat_count}x) -> gagal_looping")
+            return "gagal_looping"
+        return None
 
-            kategori_ditemukan = set()
-            
-            # 1. Scan SEMUA tool yang dipanggil secara bersamaan (Parallel Tools)
-            for tc in tool_calls:
-                nama_tool = tc.get('name') if isinstance(tc, dict) else getattr(tc, 'name', '')
-                daftar_tool_terpanggil.append(nama_tool)
+    def _resolve_tool_routes(self, tool_calls: list) -> Union[str, List[str]]:
+        kategori_ditemukan = set()
+        daftar_nama_tool = []
 
-                # ==========================================
-                # CEK INTERCEPT DI SINI 
-                # ==========================================
-                # Jika tool ada di map spesial, paksa kategorinya ke rute sub-agent.
-                # Jika tidak, biarkan berjalan normal mengikuti Lookup Table.
-                if nama_tool in self.SPECIAL_ROUTING:
-                    kategori = self.SPECIAL_ROUTING[nama_tool]
-                else:
-                    kategori = self.tool_to_category.get(nama_tool, self.fallback_route)
-                
-                kategori_ditemukan.add(kategori)
-                
-            nama_tools_log = ", ".join(daftar_tool_terpanggil)
-            
-            # Ambil semua kategori yang BUKAN fallback
-            kategori_khusus = [k for k in kategori_ditemukan if k != self.fallback_route]
+        for tc in tool_calls:
+            nama_tool = tc.get('name') if isinstance(tc, dict) else getattr(tc, 'name', '')
+            daftar_nama_tool.append(nama_tool)
 
-            # ==========================================
-            # 🔀 CABANG EKSEKUSI (PARALLEL VS SEQUENTIAL)
-            # ==========================================
-            if ENABLE_PARALLEL_ROUTING:
-                # Mode Paralel: Kembalikan list semua rute yang dibutuhkan
-                rute_final = list(kategori_ditemukan)
-                rute_final = rute_final if len(rute_final) > 1 else rute_final[0]
-                self._logger(f"[Log Router] ⚡ PARALLEL ON! AI memakai Tool [{nama_tools_log}] -> Rute Fan-out: {rute_final}")
-                return rute_final
-            else:
-                # 2. SISTEM PRIORITAS: 
-                # Jika ada kategori selain rute default (misal: ada 'sensitive' atau sub-agent), WAJIB belok ke sana
-                kategori_tujuan = self.fallback_route
-                
-                if kategori_khusus:
-                    # Intercept (coder/planner) atau sensitive harus menang mutlak sesuai prioritas
-                    if "coder" in kategori_khusus:
-                        kategori_tujuan = "coder"
-                    elif "planner" in kategori_khusus:
-                        kategori_tujuan = "planner"
-                    elif "pentest" in kategori_khusus:
-                        kategori_tujuan = "pentest"
-                    elif "sensitive" in kategori_khusus:
-                        kategori_tujuan = "sensitive"
-                    else:
-                        kategori_tujuan = kategori_khusus[0]
-
-                self._logger(f"[Log Router] 🚦 PARALLEL OFF! AI memakai Tool [{nama_tools_log}] -> Rute ke Kategori: '{kategori_tujuan}'")
-                return kategori_tujuan
-
-        konten = getattr(pesan_terakhir, "content", "") or ""
-
-        # ==========================================
-        # 🛡️ GUARDRAIL 2: RESPONS KOSONG (TIDAK ADA TOOL CALLS SAMA SEKALI)
-        # ==========================================
-        if not konten.strip():
-            print(f"[_tentukan_rute_tool] konten kosong, revision_count saat ini: {revision_count}")
-            if revision_count < self.MAX_RETRY_KOSONG:
-                self._logger(
-                    f"[Log Router] ⚠️ Respons kosong terdeteksi (percobaan retry ke-{revision_count + 1}"
-                    f"/{self.MAX_RETRY_KOSONG}) -> loop balik ke node 'otak'"
-                )
-                return "retry_kosong"
-            self._logger(
-                f"[Log Router] ❌ Respons tetap kosong setelah {self.MAX_RETRY_KOSONG}x retry "
-                f"-> rute 'gagal_kosong' (kirim pesan jujur ke user)"
+            # Resolve Category via Intercept or Lookup Table
+            kategori = self.config.special_routing.get(
+                nama_tool, 
+                self.tool_to_category.get(nama_tool, self.config.fallback_route)
             )
-            return "gagal_kosong"
+            kategori_ditemukan.add(kategori)
 
-        self._logger("[Log Router] Draf selesai. Langsung kirim jawaban ke User!")
-        return "selesai"
+        nama_tools_log = ", ".join(daftar_nama_tool)
+        kategori_khusus = [k for k in kategori_ditemukan if k != self.config.fallback_route]
+
+        # Mode Parallel Execution
+        if self.config.enable_parallel:
+            rute_final = list(kategori_ditemukan)
+            rute_final = rute_final if len(rute_final) > 1 else rute_final[0]
+            logger.info(f"[DecisionRouter] ⚡ Parallel Mode: [{nama_tools_log}] -> Fan-out: {rute_final}")
+            return rute_final
+
+        # Mode Sequential Priority
+        kategori_tujuan = self.config.fallback_route
+        if kategori_khusus:
+            # Match priority order
+            for prioritas in self.config.category_priority:
+                if prioritas in kategori_khusus:
+                    kategori_tujuan = prioritas
+                    break
+            else:
+                kategori_tujuan = kategori_khusus[0]
+
+        logger.info(f"[DecisionRouter] 🚦 Sequential Mode: [{nama_tools_log}] -> Rute: '{kategori_tujuan}'")
+        return kategori_tujuan
+
+    def _check_empty_response(self, konten: str, revision_count: int) -> str:
+        if revision_count < self.config.max_retry_kosong:
+            logger.warning(f"[DecisionRouter] ⚠️ Respons kosong (retry ke-{revision_count + 1}) -> retry_kosong")
+            return "retry_kosong"
+        logger.error(f"[DecisionRouter] ❌ Respons kosong menetap setelah retry -> gagal_kosong")
+        return "gagal_kosong"
 
     def __call__(self, state: AgentState) -> Union[str, List[str]]:
-        """
-        PINTU MASUK (Entry Point): LangGraph hanya memanggil ini.
-        """
         if not state.get("messages"):
             return "selesai"
 
         pesan_terakhir = state["messages"][-1]
         revision_count = state.get("revision_count", 0)
         tool_repeat_count = state.get("tool_repeat_count", 0)
-        return self._tentukan_rute_tool(pesan_terakhir, revision_count, tool_repeat_count)
+
+        tool_calls = getattr(pesan_terakhir, "tool_calls", [])
+        invalid_calls = getattr(pesan_terakhir, "invalid_tool_calls", [])
+
+        # 1. Guardrail JSON Cacat
+        rute_err = self._check_invalid_json(invalid_calls, tool_calls)
+        if rute_err: return rute_err
+
+        # 2. Jika ada Tool Calls
+        if tool_calls:
+            rute_loop = self._check_tool_loop(tool_repeat_count, tool_calls)
+            if rute_loop: return rute_loop
+            
+            return self._resolve_tool_routes(tool_calls)
+
+        # 3. Guardrail Respons Kosong
+        konten = getattr(pesan_terakhir, "content", "") or ""
+        if not konten.strip():
+            return self._check_empty_response(konten, revision_count)
+
+        logger.info("[DecisionRouter] Draf selesai -> selesai")
+        return "selesai"
+
+
+# ==========================================
+# 5. SPECIALIST ROUTER (SUB-AGENT)
+# ==========================================
+class SpecialistRouter(BaseRouter):
+    """
+    Router Pengawal Eksekusi Subgraph dengan Rule Heuristic yang Fleksibel.
+    """
+
+    def __init__(self, config: Optional[RouterConfig] = None):
+        self.config = config or RouterConfig()
+
+    def _is_substantive_response(self, konten: str) -> bool:
+        """Pengecekan dinamis apakah jawaban AI substansial tanpa panggil tool."""
+        konten_clean = konten.strip().lower()
+        
+        # Panjang cukup & tidak mengandung kata-kata penundaan/janji
+        panjang_cukup = len(konten_clean) >= self.config.min_content_length_substantive
+        ada_janji = any(kw in konten_clean for kw in self.config.non_final_keywords)
+
+        return panjang_cukup and not ada_janji
+
+    def __call__(self, state: AgentState) -> str:
+        messages = state.get("messages", [])
+        if not messages:
+            return "selesai"
+
+        pesan_terakhir = messages[-1]
+        tool_calls = getattr(pesan_terakhir, "tool_calls", None) or []
+        riwayat = list(_giliran_ini(messages[:-1]))
+
+        # 1. Jika AI memanggil tool
+        if tool_calls:
+            sudah_jalan = {
+                _signature(tc) for m in riwayat if getattr(m, "type", None) == "ai"
+                for tc in (getattr(m, "tool_calls", None) or [])
+            }
+            if {_signature(tc) for tc in tool_calls} & sudah_jalan:
+                return self._eskalasi(messages, "[SISTEM-LOOP]", self.config.max_nudge_loop,
+                                       "cegah_loop", "gagal_loop", "tool call mengulang persis")
+            return "safe"
+
+        # 2. Jika tool sudah pernah dipanggil sebelumnya di turn ini -> Selesai
+        if any(getattr(m, "type", None) == "tool" for m in riwayat):
+            return "selesai"
+
+        # 3. Deteksi Jawaban Substantif tanpa tool -> Selesai
+        konten = str(getattr(pesan_terakhir, "content", "") or "")
+        if self._is_substantive_response(konten):
+            logger.info("[SpecialistRouter] AI memberikan jawaban langsung yang memadai -> selesai")
+            return "selesai"
+
+        # 4. Jawaban Kosong / Narasi tanpa tool -> Paksa Retry
+        return self._eskalasi(messages, "[SISTEM]", self.config.max_percobaan_tanpa_tool,
+                               "paksa_retry", "gagal_tanpa_tool", "narasi tanpa tool call")
+
+    def _eskalasi(self, messages, marker, batas, rute_retry, rute_gagal, label) -> str:
+        hitung = sum(
+            1 for m in _giliran_ini(messages)
+            if getattr(m, "type", None) == "human" and (getattr(m, "content", "") or "").startswith(marker)
+        )
+        if hitung < batas:
+            logger.warning(f"[SpecialistRouter] ⚠️ {label} (percobaan ke-{hitung + 1}) -> {rute_retry}")
+            return rute_retry
+        logger.error(f"[SpecialistRouter] {hitung}x {label}, menyerah -> {rute_gagal}")
+        return rute_gagal
+
+# ============================================
+# --- 3. SUPERVISOR ROUTER (MULTI-AGENT INTENT CLASSIFIER) ---
+# ============================================
+class SupervisorRouter(BaseRouter):
+    """
+    Router Klasifikasi Intent (LLM-based) untuk Arsitektur Multi-Agent.
+    Bertindak sebagai pimpinan di node START untuk mengarahkan prompt user 
+    ke Agen / Subgraph Spesialis yang sesuai.
+    """
+
+    def __init__(
+        self, 
+        llm: Any, 
+        prompt: str, 
+        valid_labels: Union[List[str], set], 
+        default_route: str = "qa",
+        logger_instance=None
+    ):
+        self.llm = llm
+        self.prompt = prompt
+        # INJEKSI DINAMIS: User/Graph Config bebas menentukan label agen apapun!
+        self.valid_labels = set(valid_labels)
+        self.default_route = default_route
+        self.logger = logger_instance or logger
+
+    def __call__(self, state: AgentState) -> str:
+        # Ambil pertanyaan pesan manusia (HumanMessage) terakhir
+        pertanyaan = next(
+            (m.content for m in reversed(state.get("messages", [])) if getattr(m, "type", None) == "human"), ""
+        )
+        
+        if not pertanyaan:
+            self.logger.warning("[SupervisorRouter] Tidak ada pesan HumanMessage terdeteksi, fallback ke default.")
+            return self.default_route
+
+        try:
+            # Panggil LLM ringan untuk klasifikasi cepat
+            hasil = self.llm.invoke([
+                SystemMessage(content=self.prompt), 
+                HumanMessage(content=pertanyaan)
+            ])
+            label = (hasil.content or "").strip().lower()
+            
+            # Cari apakah ada label valid yang cocok di dalam respons LLM
+            rute = next((k for k in self.valid_labels if k in label), None)
+
+            if rute is None:
+                self.logger.warning(f"[SupervisorRouter] ⚠️ Klasifikasi tidak jelas ('{label}'), fallback ke '{self.default_route}'")
+                return self.default_route
+            
+            self.logger.info(f"[SupervisorRouter] 🎯 Input User: '{pertanyaan[:50]}...' -> Di-route ke Agen: '{rute}'")
+            return rute
+
+        except Exception as e:
+            self.logger.error(f"[SupervisorRouter] ❌ Gagal melakukan klasifikasi via LLM: {e}")
+            return self.default_route

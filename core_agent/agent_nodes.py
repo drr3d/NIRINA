@@ -46,11 +46,7 @@ def buat_ringkasan_memori(pesan_lama: list, fast_llm: Any, ringkasan_sebelumnya:
     """Menggunakan LLM sekunder yang cepat untuk meringkas obrolan usang."""
     teks_obrolan = ""
     for p in pesan_lama:
-        # [FIX] Sebelumnya cuma bedain "User" (HumanMessage) vs "AI" (semua yang
-        # lain) -- ToolMessage ikut kelabel "AI", padahal isinya hasil tool
-        # (mis. output ZAP/SQLMap), bukan omongan AI. Sekarang dilabel eksplisit
-        # pakai nama tool-nya supaya fast_llm tahu ini data mentah dari tool,
-        # bukan narasi AI, dan bisa meringkasnya secara akurat.
+ 
         if p.type == "human":
             peran = "User"
         elif p.type == "tool":
@@ -288,16 +284,17 @@ class AgentState(TypedDict):
     """
     messages: Annotated[list, add_messages]
     revision_count: Annotated[int, operator.add]
-    pending_tasks: str # <-- Tambahan baru, untuk monitoring pending task
-    summary: str # <-- TAMBAHAN BARU: Wadah untuk ringkasan
+    pending_tasks: str # <-- untuk monitoring pending task
+    summary: str # <-- untuk ringkasan
     # --- Guard pengulangan tool call (lihat _signature_tool_calls di atas) ---
     last_tool_signature: str  # hash nama+args tool call terakhir (utk deteksi ulang persis)
-    last_tool_names: str      # versi manusiawi (nama tool doang) buat reminder/log
+    last_tool_names: str      # buat reminder/log
     tool_repeat_count: Annotated[int, operator.add]  # berapa kali berturut-turut identik
 
      # ---Skill Library (Voyager-style) ---
     current_task_desc: str                              # diisi user saat kasih task baru (dipotong [:300], khusus skill library)
     current_task_desc_full: str                          # versi UTUH (tidak dipotong), khusus query Tool-RAG
+    id_pesan_task_aktif: Optional[str]                    # [BARU] id HumanMessage anchor task ini -- dilindungi dari State Cleaner selama task masih aktif
     mode_eksplorasi: Optional[bool]                       # diputuskan SEKALI di awal task -- True = referensi skill sukses SENGAJA disembunyikan (dorong eksplorasi jalur baru)
     current_skill_trace: Annotated[list,  replace_atau_tambah]   # numpuk selama task berjalan
 # ==========================================
@@ -370,6 +367,15 @@ class AIBrainProcessor:
         self.maks_umur_skill_gagal_detik = maks_umur_skill_gagal_detik
         self.min_similarity_skill_sukses = min_similarity_skill_sukses
         self.min_similarity_skill_gagal = min_similarity_skill_gagal
+
+        self.AMBANG_SIMILARITY_TINGGI = 0.85   # skor>=90 HARUS dibarengi similarity setinggi ini baru 0% eksplorasi
+        self.AMBANG_SIMILARITY_RENDAH = 0.75   # di bawah ini, similarity terlalu lemah -> WAJIB eksplorasi apapun skor-nya
+        self.min_skor_toexplore = 80
+        self.max_skor_toexplore = 90
+
+        self.max_ragquery_lstcontxtcutoff = 1000
+        self.max_humanmsgs_taskdesccutoff = 1000
+        self.probabilitas_perskill_desccutoff = 100
 
     def set_gorilla_tool_rag(self, aktif: bool) -> str:
         """
@@ -527,6 +533,7 @@ class AIBrainProcessor:
         current_task_desc_full = state.get("current_task_desc_full", "")
         current_skill_trace = state.get("current_skill_trace", [])
         mode_eksplorasi_tersimpan = state.get("mode_eksplorasi", None)
+        id_pesan_task_aktif = state.get("id_pesan_task_aktif", None)
 
         task_desc_baru = None
 
@@ -537,10 +544,12 @@ class AIBrainProcessor:
             if messages_raw and messages_raw[-1].type == "human":
                 pesan_human_terbaru = messages_raw[-1]
                 if pesan_human_terbaru.content.strip():
-                    task_desc_baru = pesan_human_terbaru.content.strip()[:300]
+                    task_desc_baru = pesan_human_terbaru.content.strip()[:self.max_humanmsgs_taskdesccutoff]
                     current_task_desc = task_desc_baru
                     human_msg_lengkap_untuk_rag = pesan_human_terbaru.content.strip()
                     current_task_desc_full = human_msg_lengkap_untuk_rag
+                   
+                    id_pesan_task_aktif = getattr(pesan_human_terbaru, "id", None)
 
         mode_eksplorasi_aktif = False
         mode_eksplorasi_baru_diputuskan = False
@@ -564,15 +573,19 @@ class AIBrainProcessor:
             if skills_gagal:
                 print(f"\n [Orchestrator] didapatkan skill gagal: {skills_gagal}")
 
-            AMBANG_SIMILARITY_TINGGI = 0.85   # skor>=90 HARUS dibarengi similarity setinggi ini baru 0% eksplorasi
-            AMBANG_SIMILARITY_RENDAH = 0.75   # di bawah ini, similarity terlalu lemah -> WAJIB eksplorasi apapun skor-nya
-
             def _probabilitas_untuk_skill(s: dict) -> float:
+                # Voyager pada umumnya ketika sudah mendapatkan path tools yang sesuai dengan task
+                #  jika kembali diberikan task yang sama, maka kemungkinan besar hampir pasti tidak akan mencari(explor)
+                #  path tools yang lebih efisien. Dengan menerapkan metoda dibawah ini, diharapkan Agent bisa mencari
+                #  path yang lebih efisien.
+                # Contoh, Task `konek ke internet`` kasus-1, mungkin percobaan pertama Agent akan mengambil 4 langkah, 
+                #           padahal untuk kasus-1 itu aslinya hanya butuh 2 langkah, jika tidak implement metoda  tambahan
+                #  seperti dibawah, akan sangat kecil kemungkinan Agent akan memperoleh path yang sempurna.
                 skor = s.get("skor", 0)
                 sim = s.get("similarity", 0)
-                if skor < 85 or sim < AMBANG_SIMILARITY_RENDAH:
+                if skor < self.min_skor_toexplore or sim < self.AMBANG_SIMILARITY_RENDAH:
                     return 1.0
-                if skor >= 90 and sim >= AMBANG_SIMILARITY_TINGGI:
+                if skor >= self.max_skor_toexplore and sim >= self.AMBANG_SIMILARITY_TINGGI:
                     return 0.0
                 return 0.5
 
@@ -582,7 +595,9 @@ class AIBrainProcessor:
                 mode_eksplorasi_aktif = mode_eksplorasi_tersimpan
             elif skills_sukses:
                 probabilitas_per_skill = [
-                    (s["deskripsi"][:50], s.get("skor", 0), s.get("similarity", 0), _probabilitas_untuk_skill(s))
+                    (s["deskripsi"][:self.probabilitas_perskill_desccutoff], 
+                     s.get("skor", 0), s.get("similarity", 0), 
+                     _probabilitas_untuk_skill(s))
                     for s in skills_sukses
                 ]
                 probabilitas_eksplorasi = min(p for *_, p in probabilitas_per_skill)
@@ -621,35 +636,85 @@ class AIBrainProcessor:
         # ==========================================
         # 🛡️ Safety Net to handle: 
         # Jinja Exception: No user query found in messages.","type":"invalid_request_error"
-        # ==========================================
+        # =========================================
         ada_human_msg = any(msg.type == "human" for msg in messages_dioptimalkan)
         if not ada_human_msg:
-            # Jika semua instruksi user sudah usang dan terhapus oleh State Cleaner,
-            # Ollama akan crash. Kita suntikkan instruksi dummy agar template Jinja aman.
-            messages_dioptimalkan.append(
-                HumanMessage(content="[Sistem Instuksi Otomatis] Lanjutkan analisismu berdasarkan data dari alat di atas.")
-            )
+            tugas_pengingat = current_task_desc_full or current_task_desc
+            if tugas_pengingat:
+                isi_pengingat = (
+                    "[Sistem Instruksi Otomatis] Instruksi ASLI kamu (sudah terhapus dari "
+                    "riwayat pesan karena manajemen memori, TAPI TETAP BERLAKU dan WAJIB "
+                    f"kamu selesaikan):\n\n\"{tugas_pengingat}\"\n\nLanjutkan menyelesaikan "
+                    "instruksi itu berdasarkan data dari alat-alat yang sudah kamu jalankan "
+                    "di atas -- JANGAN improvisasi topik baru yang tidak diminta."
+                )
+            else:
+                # Jika semua instruksi user sudah usang dan terhapus oleh State Cleaner,
+                # Ollama akan crash. Kita suntikkan instruksi dummy agar template Jinja aman.
+                isi_pengingat = "[Sistem Instuksi Otomatis] Lanjutkan analisismu berdasarkan data dari alat di atas."
+            messages_dioptimalkan.append(HumanMessage(content=isi_pengingat))
         # ==========================================
 
         # --- 3d. GORILLA-STYLE DYNAMIC TOOL RETRIEVAL ---
         # Dipanggil TEPAT SEBELUM invoke() -- bukan di step lain -- supaya query
         # RAG-nya sedekat mungkin dengan kondisi TERKINI.
         if self.tool_registry is not None and self.gorilla_aktif:
-            basis_query = current_task_desc_full or current_task_desc
+            
+            # [FIX 1] Gunakan pesan terkini agar RAG tidak nyangkut
+            pesan_human_terbaru = ""
+            for m in reversed(messages_raw):
+                if m.type == "human" and m.content.strip():
+                    pesan_human_terbaru = m.content.strip()
+                    break
+
+            # begitu pesan_human_terbaru kosong,
+            # SUBSTITUSI LANGSUNG dengan current_task_desc_full (field state
+            # terpisah, kebal dari penghapusan pesan) -- SEBELUM digabung dengan
+            # konteks_terkini, bukan cuma jadi fallback last-resort di akhir.
+            if not pesan_human_terbaru:
+                pesan_human_terbaru = current_task_desc_full or current_task_desc
+
             konteks_terkini = ""
             if current_skill_trace:  # <-- baru diperkaya kalau memang sudah mid-task
                 for m in reversed(messages_raw):
                     if m.type in ("ai", "tool") and (m.content or "").strip():
-                        konteks_terkini = m.content.strip()[:300]
+                        konteks_terkini = f"Konteks terakhir: {m.content.strip()[:self.max_ragquery_lstcontxtcutoff]}"
                         break
 
-            query_rag = " ".join(filter(None, [basis_query, konteks_terkini])).strip()
-            if not query_rag and messages_raw and messages_raw[-1].type == "human":
-                query_rag = messages_raw[-1].content.strip()
+            query_rag = " ".join(filter(None, [pesan_human_terbaru, konteks_terkini])).strip()
+            if not query_rag:
+                query_rag = current_task_desc_full or current_task_desc
 
             tools_relevan = self.tool_registry.get_relevant_tools(
                 query_rag, top_k=self.top_k_tools
             ) if query_rag else self._tools_fallback
+
+            # ==============================================================
+            # [FIX 2] INJEKSI PAKSA TOOL DARI SKILL LIBRARY SUKSES
+            # ==============================================================
+            # Ambil dari locals() agar aman dari UnboundLocalError jika dilewati
+            _skills = locals().get('skills_sukses', [])
+            
+            if _skills:
+                skill_tool_names = set()
+                for s in _skills:
+                    for trace in s.get("trace", []):
+                        if trace.get("name"):
+                            skill_tool_names.add(trace.get("name"))
+                
+                # Cek mana tool yang sudah ada di RAG
+                rag_tool_names = {t.name for t in tools_relevan}
+                
+                # Cari tool yang WAJIB ada tapi terlewat oleh RAG
+                tools_kurang = skill_tool_names - rag_tool_names
+                
+                if tools_kurang:
+                    for tool in self._tools_fallback:
+                        if tool.name in tools_kurang and tool.name not in rag_tool_names:
+                            tools_relevan.append(tool)
+                            rag_tool_names.add(tool.name) # Cegah duplikasi iterasi
+                            print(f"[🔧 Skill Injector] Memaksa masuk tool dari masa lalu: '{tool.name}'")
+            # ==============================================================
 
             print(
                 f"\n[🦍 Tool-RAG Gorilla] Query: \"{query_rag[:120]}\" -> "
@@ -721,6 +786,7 @@ class AIBrainProcessor:
         if task_desc_baru:
             update_state["current_task_desc"] = task_desc_baru
             update_state["current_task_desc_full"] = human_msg_lengkap_untuk_rag or task_desc_baru
+            update_state["id_pesan_task_aktif"] = id_pesan_task_aktif
 
         # Simpan keputusan mode eksplorasi HANYA kalau baru diputuskan turn
         # ini (lihat blok "MODE EKSPLORASI" di atas) -- supaya tetap konsisten
@@ -768,6 +834,7 @@ class AIBrainProcessor:
                 update_state["current_task_desc"] = ""
                 update_state["current_task_desc_full"] = ""
                 update_state["mode_eksplorasi"] = None
+                update_state["id_pesan_task_aktif"] = None
                 continue
                 
             if nama_tool in ("tools_reward", "tools_gagal") and self.skill_library:
@@ -779,6 +846,7 @@ class AIBrainProcessor:
                     update_state["current_task_desc"] = ""
                     update_state["current_task_desc_full"] = ""
                     update_state["mode_eksplorasi"] = None
+                    update_state["id_pesan_task_aktif"] = None
                     continue
 
                 args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
@@ -804,6 +872,7 @@ class AIBrainProcessor:
                 update_state["current_task_desc"] = ""
                 update_state["current_task_desc_full"] = ""
                 update_state["mode_eksplorasi"] = None
+                update_state["id_pesan_task_aktif"] = None
                 
         # 7. simpan status task
         if response.content:
@@ -814,17 +883,29 @@ class AIBrainProcessor:
             pass
 
         # ==========================================
-        # 8. [TAMBAHAN BARU] HAPUS PESAN LAMA DARI SQLITE (STATE CLEANER)
+        # 8. HAPUS PESAN LAMA DARI SQLITE (STATE CLEANER)
         # ==========================================
         # Agar saat sesi lama di-load, SQLite tidak menarik ratusan pesan ke RAM.
         # Angka ini adalah sisa pesan yang dibiarkan "hidup" di database.
+        # Fix: HumanMessage anchor task yang MASIH AKTIF (id-nya disimpan di
+        # id_pesan_task_aktif, lihat blok "Auto-deteksi task baru" di atas)
+        # DIKECUALIKAN dari daftar pesan yang boleh dihapus, TIDAK PEDULI
+        # posisinya di window. Begitu task selesai/dibatalkan (tools_reward/
+        # tools_gagal/tools_batal), id ini direset ke None, jadi pesan lama
+        # itu jadi boleh kehapus lagi di siklus trim berikutnya seperti biasa.
         BATAS_SIMPAN_DB = 5 # 10
         semua_pesan_asli = state.get("messages", [])
+        id_pesan_dilindungi = update_state.get("id_pesan_task_aktif", id_pesan_task_aktif)
 
         if len(semua_pesan_asli) > BATAS_SIMPAN_DB:
             # Ambil semua pesan dari awal hingga batas pemotongan
             pesan_usang = semua_pesan_asli[:-BATAS_SIMPAN_DB]
-            
+
+            # [FIX] Jangan pernah hapus pesan anchor task yang masih aktif,
+            # walau posisinya di luar window N-pesan-terakhir.
+            if id_pesan_dilindungi:
+                pesan_usang = [m for m in pesan_usang if getattr(m, "id", None) != id_pesan_dilindungi]
+
             # Buat list perintah RemoveMessage berdasarkan ID pesan
             # (Pastikan pesan memiliki ID, LangGraph otomatis memberikannya)
             perintah_hapus = [RemoveMessage(id=msg.id) for msg in pesan_usang if msg.id]

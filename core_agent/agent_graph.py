@@ -208,7 +208,6 @@ class AgentSession:
     def _update_antrean_hitl(self, thread_id: str, status_baru: str):
         return self.hitl.update_status(thread_id, status_baru)
 
-
 # ==========================================
 # START HELPER
 # ==========================================
