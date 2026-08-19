@@ -15,14 +15,6 @@ from .agent_nodes import AgentState
 logger = logging.getLogger("FrameworkRouter")
 
 # ==========================================
-# 🎚️ TOGGLE PARALLEL TOOL CALLING
-# ==========================================
-# False = (Aman untuk RAM/GPU Kecil) AI hanya dieksekusi satu per satu sesuai prioritas.
-# True  = (Butuh Spek Tinggi) Mengaktifkan Fan-out LangGraph. Agen/Node akan berjalan bersamaan.
-# Consider this deprecated
-ENABLE_PARALLEL_ROUTING = False
-
-# ==========================================
 # 1. DATACLASS KONFIGURASI ROUTER
 # ==========================================
 nofinal_kw = ["akan mencari", "akan memeriksa", "let me check"] # mungkin harus di taro di file config.json
