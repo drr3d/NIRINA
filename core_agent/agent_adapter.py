@@ -1,6 +1,9 @@
 from typing import Dict, Any, Callable
 import json
 
+# ==========================================
+# 1. UI REGISTRY (Agar Kontributor Bisa Menambah Custom View Tool)
+# ==========================================
 class ToolFormatterRegistry:
     """Registry untuk memformat tampilan Tool di UI secara dinamis (Plugin System)."""
     _registry: Dict[str, Callable[[Dict[str, Any]], str]] = {}

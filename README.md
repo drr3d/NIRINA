@@ -11,7 +11,7 @@
 
 ## 🧠 What is N.I.R.I.N.A.?
 
-**N.I.R.I.N.A.** is a modular **Agentic AI Framework** designed to turn small local language models (SLMs) into capable, tool-using autonomous agents.
+**N.I.R.I.N.A.** is a modular **Agentic AI Framework** designed to turn local language models, particularly the small ones(4-17b) (SLMs) into capable, tool-using autonomous agents.
 
 Instead of relying entirely on large cloud-based models, N.I.R.I.N.A. focuses on improving the **system around the model**:
 
@@ -158,13 +158,16 @@ The framework focuses on improving agent capabilities through the system surroun
 
 N.I.R.I.N.A. can leverage:
 
-- Small local models for resource-efficient deployments
-- Larger local models when more capable hardware is available
-- Different model architectures and runtimes
-- Structured workflows and orchestration
-- Tool grounding
-- Execution feedback
-- Iterative reasoning
+- Small local models for resource-efficient deployments.
+- Larger local models when more capable hardware is available.
+- Dynamic router to hot-switch between pre-defined llm on every turn of Re-Act. 
+- Different model architectures and runtimes.
+- Structured workflows and orchestration.
+- Tool grounding.
+- Execution feedback.
+- Iterative reasoning.
+- RAG Knowledge as optional source of think.
+- Single or Multi Agent setup.
 
 The goal is not to enforce a specific model size, but to provide a flexible agent architecture that can **scale with the available hardware and model capabilities**.
 
@@ -176,7 +179,7 @@ New capabilities can be added without rewriting the entire agent.
 
 ### 🔄 Graph-Driven Execution
 
-Built with **LangGraph**, allowing complex stateful workflows to be represented as explicit execution graphs.
+Built with **LangGraph**, allowing complex, powerfull and stateful workflows to be represented as explicit execution graphs.
 
 ### 🧩 Tool-Oriented Reasoning
 

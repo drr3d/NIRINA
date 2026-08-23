@@ -1,9 +1,10 @@
 import importlib
 import pkgutil
 import json
-from typing import Callable, Dict, Any
+from typing import Callable, Dict
 
 from ..config import config_path, app_dir
+from ..registry import ToolRegistry
 from .voyager.skill_lib import SkillLibrary
 
 # --- [DYNAMIC CONFIG] MEMBACA SETTING MODEL ---
@@ -161,10 +162,9 @@ class DynamicTokenRouterLLM:
                 continue
 
         raise RuntimeError(
-            f"[🔀 ROUTER] Semua {len(self.llm_chain)} LLM di chain gagal/di-skip untuk estimasi token."
+            f"[🔀 ROUTER] Semua {len(self.llm_chain)} LLM di chain gagal/di-skip untuk estimasi {estimasi_efektif} token."
         ) from error_terakhir
 
-# ==========================================
 # ==========================================
 # [FRAMEWORK CORE] LLM PROVIDER REGISTRY
 # ==========================================
@@ -312,7 +312,6 @@ def buat_llm(
 # ==========================================
 # [FRAMEWORK CORE] FACTORY SKILL LIBRARY DINAMIS
 # ==========================================
-# (Fungsi buat_skill_library tetap sama persis seperti sebelumnya)
 def buat_skill_library(
     peran: str,
     persist_dir_default: str = "./skill_library_db",
@@ -409,3 +408,65 @@ def muat_plugins(folder=None, nama_package_import: str = "plugins"):
     if target_folder.exists():
         for _, module_name, _ in pkgutil.iter_modules([str(target_folder)]):
             importlib.import_module(f"{nama_package_import}.{module_name}")
+
+# ==========================================
+# [FRAMEWORK CORE] BOOTSTRAP TOOL -- URUTAN WAJIB, DIGABUNG JADI SATU PANGGILAN
+# ==========================================
+def factory_tools_init(
+    *nama_tools_wajib: str,
+    folder_plugins=None,
+    nama_package_import: str = "plugins",
+):
+    """
+    [FRAMEWORK CORE] Gabungan 3 langkah yang WAJIB dipanggil berurutan di
+    SETIAP factory_*.py (security, multiagent, atau template baru apapun) --
+    urutannya di-hardcode DI SINI, bukan di file pemanggil, supaya penulis
+    factory baru tidak perlu hafal urutannya sendiri dan tidak bisa
+    salah-urut:
+
+        1. muat_plugins()                    -> trigger semua
+           @ToolRegistry.register(...)/@GuardrailRegistry.register(...) di
+           folder plugins/, jadi tool & guardrail-nya kedaftar.
+        2. ToolRegistry.sync_tools_to_db()    -> embed SEMUA tool (termasuk
+           dari plugin) ke ChromaDB, dipakai Gorilla Tool-RAG buat semantic
+           search. Kalau ini jalan SEBELUM langkah 1, tool dari plugin tidak
+           ikut ter-embed -- tidak error, cuma Gorilla jadi "buta" ke tool
+           itu terus sampai proses di-restart dengan urutan yang benar.
+        3. ToolRegistry.daftar_tool_wajib(*nama_tools_wajib) -> tool yang
+           HARUS selalu ter-bind ke main agent apapun hasil semantic
+           search-nya (biasanya tool "alur kerja", bukan tool "task", jadi
+           similarity ke deskripsi task user sering rendah).
+
+        Bahaya paling besar kalau urutan di atas dibongkar manual: kalau
+        ToolRegistry.get_all_tools()/get_tools(kategori) SUDAH kepanggil
+        SEBELUM muat_plugins() (mis. buat bind_tools()/ToolNode/
+        AIBrainProcessor) -- hasilnya berupa LIST PYTHON STATIS yang
+        di-capture SEKALI saat itu. Begitu di-capture, plugin yang baru
+        di-load SETELAHNYA tidak akan pernah muncul di list itu SEPANJANG
+        UMUR PROSES, walau tidak ada error apapun yang kelihatan. Bug jenis
+        ini yang paling nyebelin dicari manual, makanya urutannya dikunci
+        di satu fungsi ini.
+
+    SATU prasyarat yang TETAP jadi tanggung jawab PEMANGGIL (tidak bisa
+    dijamin dari sini, karena tergantung isi plugin masing-masing project):
+    panggil fungsi ini SETELAH semua instance project-specific (LLM,
+    skill_library, dst) yang mungkin dirujuk plugin lewat pola lazy-import
+    (lihat catatan lazy-import di muat_plugins()) sudah selesai dibuat.
+
+    Args:
+        *nama_tools_wajib: nama tool yang harus selalu ter-bind ke main
+            agent (diteruskan ke ToolRegistry.daftar_tool_wajib). Boleh
+            dikosongkan kalau agent ini memang tidak butuh tool wajib.
+        folder_plugins, nama_package_import: diteruskan apa adanya ke
+            muat_plugins() -- lihat docstring-nya kalau butuh folder plugin
+            custom (bukan folder default `app_dir / "plugins"`).
+    """
+    print(
+        "\n[⚙️ Bootstrap] Memuat plugin & menyinkronkan Tool-RAG -- pastikan "
+        "LLM/skill_library project ini SUDAH dibuat sebelum baris ini "
+        "dieksekusi (lihat docstring inisialisasi_plugin_dan_tools)."
+    )
+    muat_plugins(folder_plugins, nama_package_import)
+    ToolRegistry.sync_tools_to_db()
+    if nama_tools_wajib:
+        ToolRegistry.daftar_tool_wajib(*nama_tools_wajib)

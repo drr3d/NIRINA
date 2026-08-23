@@ -6,6 +6,7 @@ from collections import defaultdict
 import chromadb
 from chromadb.utils import embedding_functions
 
+default_tools = {"tools_reward", "tools_gagal", "tools_batal", "lupakan_skill_gagal"} # consider move this to config.json
 class ToolRegistry:
     """Registry framework dinamis dengan Backward Compatibility penuh + Tool-RAG."""
     _tools = defaultdict(list)
@@ -16,7 +17,7 @@ class ToolRegistry:
     _embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="paraphrase-multilingual-MiniLM-L12-v2")
     _collection = _chroma_client.get_or_create_collection(name="tool_library", embedding_function=_embed_fn)
 
-    _tools_wajib_selalu = {"tools_reward", "tools_gagal", "tools_batal", "lupakan_skill_gagal"}
+    _tools_wajib_selalu = default_tools
     # -----------------------------------------------
 
     @classmethod

@@ -198,25 +198,19 @@ class AgentSession:
             if hasattr(pesan_terakhir, "tool_calls") and pesan_terakhir.tool_calls:
                 self.hitl.record(thread_id, pesan_terakhir.tool_calls)
 
-        #return self.executor.get_state(config)
         return state_terbaru   # <- jangan round-trip DB lagi
 
-    # --- Shim: nama method privat lama TETAP JALAN, tanpa modul lain diubah ---
     def _rekam_antrean_hitl(self, thread_id: str, tool_calls: list):
         return self.hitl.record(thread_id, tool_calls)
 
     def _update_antrean_hitl(self, thread_id: str, status_baru: str):
         return self.hitl.update_status(thread_id, status_baru)
 
+
 # ==========================================
 # START HELPER
-# ==========================================
 # [FRAMEWORK] MESIN PENERJEMAH CONFIG DEKLARATIF -> LANGGRAPH API
 # ==========================================
-# Tiap "type" di graph_config punya handler kecil sendiri, didaftarkan lewat
-# dict _HANDLER_PER_TIPE. Nambah tipe config baru nanti = nambah 1 fungsi +
-# 1 baris di dict ini -- rakit_graph_dari_config() sendiri tidak perlu
-# disentuh lagi (dulu if/elif yang terus memanjang tiap ada tipe baru).
 def _proses_node(workflow, item, interrupt_before, interrupt_after):
     workflow.add_node(item["name"], item["func"])
     if item.get("interrupt_before"):

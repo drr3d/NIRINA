@@ -2,15 +2,15 @@ from langgraph.prebuilt import ToolNode
 
 from ..agent_nodes import AIBrainProcessor
 from .agent_factory import (
-    LLMProviderRegistry, buat_llm, buat_skill_library, muat_plugins,
+    LLMProviderRegistry, buat_llm, buat_skill_library, factory_tools_init
 )
 from ..registry import ToolRegistry
 from ..systemprompt_collection import system_prompt # adjust with your py system prompt file
 
-# ==========================================
+# 1. ========================================================
+# ============= DEFINE/CHOSE THE BRAIN =================
 # [CONTOH CUSTOM EXTENSION] USER MENAMBAH PROVIDER GEMINI
 # User cukup membuat fungsi builder sesuai aturan framework, lalu me-register-nya.
-# ==========================================
 def _build_google_gemini(model_name: str, temperature: float, **kwargs):
     from langchain_google_genai import ChatGoogleGenerativeAI
     
@@ -25,14 +25,15 @@ def _build_google_gemini(model_name: str, temperature: float, **kwargs):
 # Daftarkan ke framework!
 LLMProviderRegistry.register("gemini", _build_google_gemini)
 
-# 2. Planner (Menggunakan Custom Provider yang baru didaftarkan di atas!)
+# Planner (Menggunakan Custom Provider yang baru didaftarkan di atas!)
 LLM = buat_llm(
     "main", 
     model_default="gemini-2.5-flash", 
     provider_default="gemini", # <-- Memanggil custom builder Google!
 )
+# ==========================================================
 
-# [PROJECT-SPECIFIC] Skill library Voyager-style buat agent
+# 1.b(Optional) [PROJECT-SPECIFIC] Skill library Voyager-style buat agent
 skill_lib = buat_skill_library(
     "qa",
     persist_dir_default="./skill_library_db",
@@ -41,16 +42,11 @@ skill_lib = buat_skill_library(
     ollama_model_default="nomic-embed-text",
 )
 
-# Load all plugins dari dir plugins
+# 2. Load all plugins dari dir plugins
 # plugins = tools for agent
-muat_plugins()
+factory_tools_init() #  Read function docstring for more instruction
 
-# --- GORILLA-STYLE TOOL-RAG: SINKRONISASI KE CHROMADB ---
-# Harus SETELAH muat_plugins() (supaya tool dari plugins/*.py ikut ke-embed),
-# tapi SEBELUM AIBrainProcessor dibentuk di bawah. Idempotent (upsert), aman
-# dipanggil tiap kali proses ini start meski koleksi Chroma-nya sudah pernah diisi.
-ToolRegistry.sync_tools_to_db()
-
+# 3. Define AI Orchestrator for graph
 AI = AIBrainProcessor(LLM, 
                       ToolRegistry.get_all_tools(), 
                       system_prompt,
@@ -58,8 +54,8 @@ AI = AIBrainProcessor(LLM,
                       skill_library=skill_lib
                       )
 
-# Prepare tools
+# 4. Prepare tools
 safe_tools = ToolRegistry.get_tools("safe")
 
-# Prepare Node
+# 5. Prepare Node
 eksekutor_safe = ToolNode(safe_tools)
