@@ -182,7 +182,7 @@ def optimasi_konteks_langchain(
 
         is_giliran_selesai = idx < last_human_idx
 
-        # [FIX] Cek ambang pakai akumulasi SEBELUM pesan ini ditambahkan.
+        # Cek ambang pakai akumulasi SEBELUM pesan ini ditambahkan.
         long_context_inturn = not is_giliran_selesai and (
             (total_msgs - idx) > BATAS_PESAN_AMAN_DALAM_GILIRAN
             or akumulasi_karakter_inturn > BATAS_KARAKTER_AMAN_DALAM_GILIRAN 
@@ -322,6 +322,7 @@ class AgentState(TypedDict):
     mode_eksplorasi: Optional[bool]                       # diputuskan SEKALI di awal task -- True = referensi skill sukses SENGAJA disembunyikan (dorong eksplorasi jalur baru)
     gorilla_aktif_override: Optional[bool]                # toggle Tool-RAG PER-SESI (None = ikut default instance/config, True/False = override percakapan ini doang -- lihat catatan di __init__)
     current_skill_trace: Annotated[list,  replace_atau_tambah]   # numpuk selama task berjalan
+    tools_dipaksa_manual: Annotated[list, replace_atau_tambah]   # nama tool yang diminta AI lewat sinyal 'minta_tool_manual' -- lihat GorillaToolSelector.proses_permintaan_tool_manual
 
 # ==========================================
 # --- 2. SUB-KOMPONEN SPESIALISASI ---
@@ -520,10 +521,20 @@ class SkillLibraryOrchestrator:
 class GorillaToolSelector:
     """
     Membungkus 'Tool-RAG ala Gorilla': pilih subset tool yang paling relevan
-    untuk giliran ini (bukan selalu bind SEMUA tool ke LLM), plus dua
-    pengaman supaya tool yang SEHARUSNYA tetap ada (dipakai skill sukses
-    acuan / lagi dipakai di task yang sedang berjalan) tidak sampai kelewat
-    oleh hasil retrieval.
+    untuk giliran ini (bukan selalu bind SEMUA tool ke LLM), plus TIGA
+    pengaman supaya tool yang SEHARUSNYA tetap ada tidak sampai kelewat oleh
+    hasil retrieval:
+      1. Tool dari skill sukses acuan (skill library).
+      2. Tool yang sedang aktif dipakai di trace task berjalan.
+      3. Tool yang DIMINTA EKSPLISIT oleh AI lewat sinyal tool
+         'minta_tool_manual' -- buat kasus di luar 2 pengaman di atas: AI
+         "ingat"/yakin sebuah tool itu ada (pernah dipakai, disebut di
+         riwayat/skill library, atau diminta eksplisit oleh user), tapi
+         similarity semantic-nya ke query saat ini kebetulan rendah sehingga
+         RAG tidak menyertakannya. Tanpa ini, AI cuma bisa lapor ke user
+         "tool itu tidak tersedia" padahal aslinya ADA di `tools_fallback`.
+         Lihat proses_permintaan_tool_manual() & plugin_minta_tool_manual.py
+         (contoh registrasi tool-nya) untuk detail lengkap.
     """
 
     def __init__(
@@ -533,14 +544,29 @@ class GorillaToolSelector:
         llm_mentah: Any,
         top_k_tools: int = 8,
         max_ragquery_lstcontxtcutoff: int = 1000,
+        maks_tool_dipaksa_manual: int = 6,
     ):
         self.tool_registry = tool_registry
         self.tools_fallback = tools_fallback
         self.llm_mentah = llm_mentah
         self.top_k_tools = top_k_tools
         self.max_ragquery_lstcontxtcutoff = max_ragquery_lstcontxtcutoff
+        # Batas berapa banyak tool yang boleh "numpuk" lewat minta_tool_manual
+        # DALAM SATU TASK -- jaga-jaga kalau AI spam sinyal ini (typo berulang,
+        # atau kebiasaan minta tool "just in case") supaya tidak balik lagi
+        # membengkakkan jumlah tool yang ter-bind (defeat tujuan awal Tool-RAG:
+        # hemat token skema tool per giliran).
+        self.maks_tool_dipaksa_manual = maks_tool_dipaksa_manual
 
         self.aktif_default = tool_registry is not None
+
+    @property
+    def nama_semua_tool(self) -> set:
+        """Nama SEMUA tool yang genuinely ada untuk agent ini (dari
+        `tools_fallback`, list lengkap yang dikirim saat AIBrainProcessor
+        dibentuk) -- dipakai buat validasi permintaan minta_tool_manual,
+        BUKAN dari hasil retrieval RAG yang cuma subset."""
+        return {t.name for t in self.tools_fallback}
 
     def _bangun_query_rag(self, messages_raw, current_skill_trace, current_task_desc, current_task_desc_full) -> str:
         # [FIX 1] Gunakan pesan terkini agar RAG tidak nyangkut
@@ -558,6 +584,28 @@ class GorillaToolSelector:
                 if m.type in ("ai", "tool") and (m.content or "").strip():
                     konteks_terkini = f"Konteks terakhir: {m.content.strip()[:self.max_ragquery_lstcontxtcutoff]}"
                     break
+        elif len(messages_raw) >= 2 and messages_raw[-2].type == "ai" and _bukan_nudge_sistem(messages_raw[-2].content):
+            # Jika current_skill_trace kosong,
+            # BUKAN cuma berarti "task baru" -- bisa juga berarti "giliran
+            # sebelumnya AI TIDAK memanggil tool sama sekali" (mis. user
+            # eksplisit minta "jelaskan rencanamu, JANGAN panggil tools dulu").
+            # Tanpa cabang ini: rencana detail yang baru saja disusun AI (yang
+            # correctly menyebut tool-tool teknis yang relevan) akan LENYAP
+            # total dari query Tool-RAG begitu user membalas singkat ("oke
+            # sekarang jalankan itu semua") -- soalnya current_task_desc_full
+            # ikut ke-reset ke pesan singkat itu (skill_trace masih kosong ->
+            # "Auto-deteksi task baru" nganggap ini task baru), dan cabang
+            # `if current_skill_trace:` di atas juga tidak pernah aktif.
+            #
+            # SENGAJA cuma cek POSISI -2 (persis 1 pesan sebelum HumanMessage
+            # baru ini), BUKAN scan mundur bebas seperti cabang di atas --
+            # supaya tetap aman dari kontaminasi task lain yang sudah lama
+            # closed (itu alasan awal kenapa scan mundur dulu dibatasi ke
+            # "mid-task saja" -- lihat histori fix sebelumnya). Cek posisi
+            # berdekatan jauh lebih kecil risikonya: kalau posisi -2 memang
+            # AI message asli (bukan nudge sistem), itu hampir pasti respons
+            # LANGSUNG ke pesan human sebelum si pesan terbaru, jadi relevan.
+            konteks_terkini = f"Konteks terakhir: {messages_raw[-2].content.strip()[:self.max_ragquery_lstcontxtcutoff]}"
 
         query_rag = " ".join(filter(None, [pesan_human_terbaru, konteks_terkini])).strip()
         if not query_rag:
@@ -578,6 +626,72 @@ class GorillaToolSelector:
                 rag_tool_names.add(tool.name)
                 print(f"{label_log}: '{tool.name}'")
 
+    def proses_permintaan_tool_manual(self, nama_diminta: str, tools_dipaksa_manual_sebelumnya: list) -> dict:
+        """
+        Handle sinyal tool 'minta_tool_manual' (lihat
+        AIBrainProcessor._proses_sinyal_tool_khusus & contoh registrasi tool
+        aslinya di plugin_minta_tool_manual.py). Validasi nama tool terhadap
+        `nama_semua_tool` (daftar tool ASLI, bukan subset RAG) SEBELUM
+        dipersist ke state -- soalnya kalau nama hasil typo/halusinasi LLM
+        sampai kebobolan masuk `tools_dipaksa_manual`, entry itu akan numpuk
+        SELAMANYA sepanjang task (di-scan ulang tiap giliran lewat
+        pilih_llm(), tapi tidak akan pernah match tool apapun -- cuma jadi
+        sampah state).
+
+        Return dict update_state PARSIAL:
+          - {} kalau ditolak (nama kosong/tidak ditemukan/sudah pernah
+            diminta/sudah kena batas maks_tool_dipaksa_manual) -- TIDAK ADA
+            perubahan state sama sekali.
+          - {"tools_dipaksa_manual": [nama_diminta]} kalau diterima -- list
+            berisi HANYA 1 item baru (reducer `replace_atau_tambah` di
+            AgentState yang menggabungkannya dengan yang sudah ada, pola
+            yang sama dengan current_skill_trace).
+        """
+        nama_diminta = (nama_diminta or "").strip()
+        sudah_ada = tools_dipaksa_manual_sebelumnya or []
+
+        if not nama_diminta:
+            return {}
+
+        if nama_diminta not in self.nama_semua_tool:
+            print(
+                f"\n[🧩 Tool Manual Override] '{nama_diminta}' TIDAK DITEMUKAN "
+                f"di daftar tool yang tersedia sama sekali -- diabaikan."
+            )
+            return {}
+
+        if nama_diminta in sudah_ada:
+            print(
+                f"\n[🧩 Tool Manual Override] '{nama_diminta}' sudah pernah "
+                f"diminta sebelumnya di task ini -- tidak diduplikasi."
+            )
+            return {}
+
+        if len(sudah_ada) >= self.maks_tool_dipaksa_manual:
+            print(
+                f"\n[🧩 Tool Manual Override] Sudah mencapai batas "
+                f"{self.maks_tool_dipaksa_manual} tool manual untuk task ini "
+                f"-- permintaan '{nama_diminta}' diabaikan."
+            )
+            return {}
+
+        print(
+            f"\n[🧩 Tool Manual Override] '{nama_diminta}' DITEMUKAN -- akan "
+            f"dipaksa ikut ter-bind mulai giliran BERIKUTNYA untuk sisa task ini."
+        )
+        return {"tools_dipaksa_manual": [nama_diminta]}
+
+    @staticmethod
+    def reset_tool_manual() -> dict:
+        """Reset di batas task -- dipanggil BARENGAN
+        SkillLibraryOrchestrator.reset_task_state() di
+        AIBrainProcessor._proses_sinyal_tool_khusus (saat tools_batal atau
+        tools_reward/tools_gagal). Override manual ini SENGAJA task-scoped,
+        BUKAN permanen sepanjang sesi -- supaya task baru mulai dari hasil
+        Tool-RAG bersih lagi, tidak numpuk override dari task-task
+        sebelumnya yang sudah tidak relevan."""
+        return {"tools_dipaksa_manual": None}
+
     def pilih_llm(
         self,
         *,
@@ -587,6 +701,7 @@ class GorillaToolSelector:
         current_task_desc_full: str,
         gorilla_aktif_override: Optional[bool],
         skills_sukses: list,
+        tools_dipaksa_manual: Optional[list] = None,
     ):
         """Return LLM yang sudah di-bind_tools() dengan subset tool yang
         relevan (atau SEMUA tool fallback kalau Tool-RAG nonaktif)."""
@@ -624,6 +739,16 @@ class GorillaToolSelector:
             self._paksa_masuk(
                 tools_relevan, rag_tool_names, active_tool_names,
                 "[🔒 Tool Lock] Mengunci tool yang sedang dipakai di task ini",
+            )
+
+        # [FIX 4] INJEKSI PAKSA TOOL YANG DIMINTA MANUAL OLEH AI
+        # (lihat proses_permintaan_tool_manual -- nama di sini sudah
+        # divalidasi SEBELUM dipersist ke state, jadi di sini tinggal
+        # dipercaya apa adanya).
+        if tools_dipaksa_manual:
+            self._paksa_masuk(
+                tools_relevan, rag_tool_names, set(tools_dipaksa_manual),
+                "[🧩 Tool Manual Override] Menambahkan tool yang diminta manual",
             )
 
         print(
@@ -704,6 +829,7 @@ class AIBrainProcessor:
         # --- GORILLA-STYLE DYNAMIC TOOL RETRIEVAL ---
         tool_registry: Any = None,   # <-- instance/class ToolRegistry, opsional
         top_k_tools: int = 8,
+        maks_tool_dipaksa_manual: int = 6,  # <-- lihat GorillaToolSelector.proses_permintaan_tool_manual
 
         batas_simpan_db: int = 10,
         max_humanmsgs_taskdesccutoff: int = 1000,
@@ -748,6 +874,7 @@ class AIBrainProcessor:
             tools_fallback=tools_list,
             llm_mentah=llm_model,
             top_k_tools=top_k_tools,
+            maks_tool_dipaksa_manual=maks_tool_dipaksa_manual,
         )
 
     # --- Properti backward-compat
@@ -1031,12 +1158,16 @@ class AIBrainProcessor:
             update_state["last_tool_signature"] = ""
             update_state["last_tool_names"] = ""
 
-    def _proses_sinyal_tool_khusus(self, update_state, response, current_task_desc, current_skill_trace):
+    def _proses_sinyal_tool_khusus(self, update_state, response, current_task_desc, current_skill_trace, tools_dipaksa_manual):
         """Tangkap 'sinyal' tool khusus di tool_calls giliran ini -- ini
         BUKAN eksekusi tool (itu tetap lewat ToolNode seperti biasa), cuma
         efek samping di STATE yang perlu dicatat begitu AI memutuskan
         memanggilnya:
           - atur_gorilla_tool_rag    -> toggle Tool-RAG per SESI
+          - minta_tool_manual        -> paksa satu tool ikut ter-bind
+            mulai giliran berikutnya, buat kasus tool itu GENUINELY ada
+            tapi kelewat oleh semantic search Tool-RAG (lihat
+            GorillaToolSelector.proses_permintaan_tool_manual)
           - tools_batal              -> buang jejak skill task yang menggantung
           - tools_reward/tools_gagal -> simpan skill baru (delegasi ke
             SkillLibraryOrchestrator) lalu reset jejak task
@@ -1057,21 +1188,36 @@ class AIBrainProcessor:
                 # lewat ToolNode (kategori "safe") supaya tetap ada ToolMessage
                 # balasan yang sah buat giliran ini.
 
+            # --- Catch SINYAL INJEKSI TOOL MANUAL ---
+            if nama_tool == "minta_tool_manual":
+                update_state.update(
+                    self._tools.proses_permintaan_tool_manual(
+                        args.get("nama_tool", ""), tools_dipaksa_manual
+                    )
+                )
+                # SENGAJA tidak `continue` -- sama seperti atur_gorilla_tool_rag,
+                # tool ini tetap dieksekusi normal lewat ToolNode supaya ada
+                # ToolMessage balasan yang sah (isi pesan approve/reject-nya
+                # ditentukan tool aslinya sendiri -- lihat
+                # plugin_minta_tool_manual.py -- BUKAN dari sini).
+
             # --- TAMBAHAN UNTUK RESET/BATAL ---
             if nama_tool == "tools_batal":
                 print("[Skill Library] 🧹 Membatalkan dan mereset jejak task yang menggantung.")
                 update_state.update(SkillLibraryOrchestrator.reset_task_state())
+                update_state.update(GorillaToolSelector.reset_tool_manual())
                 continue
 
             if nama_tool in ("tools_reward", "tools_gagal") and self.skill_library:
                 update_state.update(
                     self._skills.simpan_skill(nama_tool, args, current_task_desc, current_skill_trace)
                 )
+                update_state.update(GorillaToolSelector.reset_tool_manual())
 
     def _bangun_update_state(
         self, *, response, ringkasan_baru, revision_count,
         tool_repeat_count, last_tool_signature,
-        current_task_desc, current_skill_trace,
+        current_task_desc, current_skill_trace, tools_dipaksa_manual,
         task_desc_baru, human_msg_lengkap_untuk_rag, id_pesan_task_aktif,
         mode_eksplorasi_aktif, mode_eksplorasi_baru_diputuskan,
     ):
@@ -1106,7 +1252,7 @@ class AIBrainProcessor:
             update_state["revision_count"] = -revision_count  # reset ke 0
 
         self._update_tool_repeat_signature(update_state, response, tool_repeat_count, last_tool_signature)
-        self._proses_sinyal_tool_khusus(update_state, response, current_task_desc, current_skill_trace)
+        self._proses_sinyal_tool_khusus(update_state, response, current_task_desc, current_skill_trace, tools_dipaksa_manual)
 
         # simpan status task
         if response.content:
@@ -1151,7 +1297,8 @@ class AIBrainProcessor:
           3. Deteksi anchor task baru (dipakai skill library & Tool-RAG).
           4. Siapkan konteks skill library (retrieval, mode eksplorasi).
           5. Safety-net: pastikan selalu ada HumanMessage di prompt.
-          6. Pilih tool relevan (Tool-RAG Gorilla) lalu panggil LLM.
+          6. Pilih tool relevan (Tool-RAG Gorilla, termasuk tool manual
+             override dari minta_tool_manual) lalu panggil LLM.
           7. Susun update_state balasan (trace, task desc, guard, dst).
           8. Bersihkan pesan usang dari SQLite (state cleaner).
         """
@@ -1167,6 +1314,7 @@ class AIBrainProcessor:
         current_task_desc = state.get("current_task_desc", "")
         current_task_desc_full = state.get("current_task_desc_full", "")
         current_skill_trace = state.get("current_skill_trace", [])
+        tools_dipaksa_manual = state.get("tools_dipaksa_manual", [])
         mode_eksplorasi_tersimpan = state.get("mode_eksplorasi", None)
         id_pesan_task_aktif = state.get("id_pesan_task_aktif", None)
         gorilla_aktif_override = state.get("gorilla_aktif_override", None)
@@ -1203,6 +1351,7 @@ class AIBrainProcessor:
             current_task_desc_full=current_task_desc_full,
             gorilla_aktif_override=gorilla_aktif_override,
             skills_sukses=skill_ctx["skills_sukses"],
+            tools_dipaksa_manual=tools_dipaksa_manual,
         )
 
         print("\n[Log Sistem] AI Utama sedang menganalisis input atau menyusun jawaban...")
@@ -1218,6 +1367,7 @@ class AIBrainProcessor:
             last_tool_signature=last_tool_signature,
             current_task_desc=current_task_desc,
             current_skill_trace=current_skill_trace,
+            tools_dipaksa_manual=tools_dipaksa_manual,
             task_desc_baru=task_desc_baru,
             human_msg_lengkap_untuk_rag=human_msg_lengkap_untuk_rag,
             id_pesan_task_aktif=id_pesan_task_aktif,
