@@ -232,6 +232,7 @@ Example capabilities:
 - Deep crawling
 - Security-oriented tool orchestration
 - Automated reconnaissance workflows
+- OSINT
 
 > Tools can be isolated from the core agent environment when required.
 
@@ -316,9 +317,3 @@ N.I.R.I.N.A. treats the LLM as the **reasoning core**, while Sensors/Tool provid
 > 🚧 **N.I.R.I.N.A. is currently under active development.**
 
 The framework architecture is evolving as new agent workflows, tools, models, and execution strategies are tested.
-
----
-
-## 📜 License
-
-License information will be added as the project approaches public release.
