@@ -25,7 +25,7 @@ def _ambil_tool_by_name(nama: str):
 
 
 def _skema_param(tool_obj) -> dict:
-    """[BARU] Baca skema argumen tool langsung dari objek LangChain-nya
+    """ Baca skema argumen tool langsung dari objek LangChain-nya
     (tool.args -- auto-generate dari type hints function aslinya, TIDAK perlu
     didaftarkan manual di file ini). Return dict {nama_param: tipe_str}."""
     if tool_obj is None:
@@ -37,14 +37,14 @@ def _skema_param(tool_obj) -> dict:
 
 
 def _reorder_aman(steps: list, idx_a: int, idx_b: int) -> bool:
-    """[BARU] Simulasikan swap step idx_a & idx_b, cek SEMUA referensi
+    """ Simulasikan swap step idx_a & idx_b, cek SEMUA referensi
     'from_step' (step tool) DAN 'sumber_step' (step ai_transform) di seluruh
     alur masih menunjuk ke step SEBELUM dirinya setelah swap. Return False
     kalau ada step yang jadinya "meminta data dari masa depan" -- itu yang
     bikin tombol ▲▼ di-disable/ditolak, biar draft gak pernah nyampe ke
     state yang gak valid.
 
-    [BARU] Juga cegah reorder yang nyentuh index manapun di ANTARA sumber
+     Juga cegah reorder yang nyentuh index manapun di ANTARA sumber
     dan tujuan lompatan manapun -- 'lompat_jika.ke_step' itu index ABSOLUT,
     kalau urutan digeser tapi angkanya gak ikut nyesuaian, lompatan bisa
     diem-diem nunjuk ke step yang SALAH tanpa ada error apapun."""
@@ -69,7 +69,7 @@ def _reorder_aman(steps: list, idx_a: int, idx_b: int) -> bool:
 
 
 def _label_step(step: dict, index: int) -> str:
-    """[BARU] Label ringkas 1 step, aman buat SEMUA jenis step (tool ATAU
+    """ Label ringkas 1 step, aman buat SEMUA jenis step (tool ATAU
     ai_transform) -- dipakai di preview, dropdown 'ambil dari step mana', dan
     panel detail, biar gak ada 1 tempat pun yang asumsi step['tool'] selalu ada."""
     if step.get("type") == "ai_transform":
@@ -79,7 +79,7 @@ def _label_step(step: dict, index: int) -> str:
 
 
 def _hitung_step_kondisional(steps: list) -> set:
-    """[BARU] Return set index step yang BISA DILEWATI (gak selalu jalan)
+    """ Return set index step yang BISA DILEWATI (gak selalu jalan)
     karena ada di rentang lompatan step lain. Dipakai buat kasih indikator
     visual "step ini kondisional, bukan wajib jalan" -- biar orang yang baca
     alur ini (bukan cuma yang bikin) gak salah kira semua step pasti
@@ -94,7 +94,7 @@ def _hitung_step_kondisional(steps: list) -> set:
 
 
 def _tampilkan_ringkasan_kondisional(steps: list):
-    """[BARU] Banner ringkasan di atas daftar step -- "N dari M step SELALU
+    """ Banner ringkasan di atas daftar step -- "N dari M step SELALU
     jalan" -- render sekali di atas, sebelum daftar step satu-satu."""
     kondisional = _hitung_step_kondisional(steps)
     if kondisional:
@@ -107,7 +107,7 @@ def _tampilkan_ringkasan_kondisional(steps: list):
 
 
 def _pecah_interval(detik: int) -> tuple:
-    """[BARU] Kebalikan dari perhitungan 'value x satuan -> total detik' yang
+    """ Kebalikan dari perhitungan 'value x satuan -> total detik' yang
     dipakai pas SIMPAN -- dipakai buat prefill form EDIT (INTERVAL) supaya
     gak nampilin '3600 Detik', tapi '1 Jam'."""
     if detik % 86400 == 0 and detik >= 86400:
@@ -257,7 +257,7 @@ def render():
                             db.ubah_status(selected_id, "STOPPED")
                             st.rerun()
                 with col_aksi2:
-                    # [BARU] Edit -- load steps automation ini ke draft, form
+                    #  Edit -- load steps automation ini ke draft, form
                     # "Buat Automation Baru" di bawah otomatis pindah ke mode edit.
                     if st.button("✏️ Edit", key=f"edit_{selected_id}", use_container_width=True):
                         langkah_edit = json.loads(auto_detail['steps_json'])
@@ -290,7 +290,7 @@ def render():
                         except requests.exceptions.RequestException as e:
                             st.error(f"Gak bisa hubungi daemon: {e}")
 
-                # --- [BARU] Riwayat Eksekusi ---
+                # ---  Riwayat Eksekusi ---
                 st.write("---")
                 st.write("**🕘 Riwayat Eksekusi Terakhir**")
                 riwayat = db.ambil_riwayat(selected_id, limit=5)
@@ -334,7 +334,7 @@ def render():
         "Nama Automation:", value=prefill.get("nama_alur", ""),
         placeholder="Misal: Reminder Interview Harian", key=f"nama_alur{key_suffix}",
     )
-    # [BARU] EVENT -- automation ini gak jalan berdasar jam/interval, tapi
+    #  EVENT -- automation ini gak jalan berdasar jam/interval, tapi
     # nunggu automation LAIN selesai dengan status tertentu (lihat diagram
     # chaining yang dibahas sebelumnya).
     opsi_jadwal = ["DAILY", "INTERVAL", "EVENT"]
@@ -393,8 +393,8 @@ def render():
     st.divider()
 
     # ==========================================
-    # 3. RAKIT ALUR EKSEKUSI -- [BARU] baca argumen tool + pilihan sumber nilai
-    #    + [BARU] jenis step "AI Transform" (ekstrak nilai dari step lain)
+    # 3. RAKIT ALUR EKSEKUSI --  baca argumen tool + pilihan sumber nilai
+    #    +  jenis step "AI Transform" (ekstrak nilai dari step lain)
     # ==========================================
     st.write("**Rakit Alur Eksekusi:**")
 
@@ -412,8 +412,8 @@ def render():
     ai_sumber_step = None
     ai_target_tool = None
     ai_instruksi = None
-    ai_param_terpilih = None    # [BARU] param mana di tool tujuan yang diisi hasil AI
-    ai_args_lain = {}           # [BARU] param LAIN di tool tujuan (kalau lebih dari 1)
+    ai_param_terpilih = None    #  param mana di tool tujuan yang diisi hasil AI
+    ai_args_lain = {}           #  param LAIN di tool tujuan (kalau lebih dari 1)
 
     if jenis_step == "Panggil Tool":
         daftar_tools = sorted(t.name for t in ToolRegistry.get_tools("safe"))
@@ -456,7 +456,7 @@ def render():
             pilihan_target = st.selectbox(
                 "Lanjutkan otomatis ke tool (opsional):",
                 daftar_tools_konteks, key="ai_target_tool",
-                help="[BARU] Pilih tool di sini kalau kamu mau hasil ekstraksi AI LANGSUNG dipakai buat "
+                help=" Pilih tool di sini kalau kamu mau hasil ekstraksi AI LANGSUNG dipakai buat "
                      "manggil tool itu -- sistem otomatis nambahin step pemanggilannya, gak perlu kamu "
                      "tambah manual lagi. Kosongkan kalau cuma butuh nilai ekstraksinya buat step LAIN nanti.",
             )

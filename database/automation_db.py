@@ -1,4 +1,3 @@
-# File: core_agent/automation_db.py
 import sqlite3
 import json
 import uuid
@@ -36,7 +35,7 @@ def init_db():
                 )
             ''')
 
-            # --- [BARU] Migrasi kolom last_run_at ke tabel lama (kalau ada) ---
+            # --- Migrasi kolom last_run_at ke tabel lama (kalau ada) ---
             # Dipakai daemon buat tau "apa job DAILY jam 09:00 ini udah jalan
             # hari ini belum" / "udah berapa detik sejak job INTERVAL ini
             # terakhir jalan". NULL = belum pernah jalan sama sekali.
@@ -44,7 +43,7 @@ def init_db():
                 conn.execute("ALTER TABLE automations ADD COLUMN last_run_at TIMESTAMP")
                 logging.info("Migrasi: kolom 'last_run_at' ditambahkan ke tabel automations.")
 
-            # --- [BARU] Migrasi kolom buat trigger EVENT (chaining antar-automation) ---
+            # --- Migrasi kolom buat trigger EVENT (chaining antar-automation) ---
             # depends_on_id   : id automation LAIN yang jadi pemicu (NULL kalau
             #                   tipe_jadwal bukan EVENT).
             # depends_on_status: "SUKSES" | "GAGAL" | "ANY" -- status run automation
@@ -56,7 +55,7 @@ def init_db():
                 conn.execute("ALTER TABLE automations ADD COLUMN depends_on_status TEXT")
                 logging.info("Migrasi: kolom 'depends_on_status' ditambahkan ke tabel automations.")
 
-            # --- [BARU] Tabel riwayat eksekusi ---
+            # --- Tabel riwayat eksekusi ---
             # SATU baris = SATU kali automation ini beneran dijalankan daemon.
             # Terpisah dari tabel automations (yang cuma nyimpen definisi/status
             # aktif) supaya histori gak numpuk/nge-bloat tabel utama, dan gampang
@@ -163,7 +162,7 @@ def update_automation(
     depends_on_id: Optional[str] = None,
     depends_on_status: Optional[str] = None,
 ):
-    """[BARU] Update automation yang SUDAH ADA -- validasi persis sama dengan
+    """Update automation yang SUDAH ADA -- validasi persis sama dengan
     tambah_automation() (lihat situ buat detail format `steps`). `status`
     (RUNNING/STOPPED) TIDAK disentuh di sini -- itu tetap lewat ubah_status().
 
@@ -232,7 +231,7 @@ def ambil_semua_automation() -> List[Dict[str, Any]]:
 
 
 def ambil_automation_running() -> List[Dict[str, Any]]:
-    """[BARU] Khusus dipakai daemon -- cuma tarik yang statusnya RUNNING,
+    """Khusus dipakai daemon -- cuma tarik yang statusnya RUNNING,
     biar daemon gak perlu filter ulang di Python tiap polling cycle."""
     try:
         with sqlite3.connect(sqlite_db_path, timeout=30.0) as conn:
@@ -246,7 +245,7 @@ def ambil_automation_running() -> List[Dict[str, Any]]:
 
 
 def ambil_satu_automation(alur_id: str) -> Optional[Dict[str, Any]]:
-    """[BARU] Ambil 1 automation by id -- dipakai endpoint /run_now daemon."""
+    """Ambil 1 automation by id -- dipakai endpoint /run_now daemon."""
     try:
         with sqlite3.connect(sqlite_db_path, timeout=30.0) as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -274,7 +273,7 @@ def ubah_status(alur_id: str, status_baru: str):
 
 
 def update_last_run(alur_id: str, waktu_epoch: Optional[float] = None):
-    """[BARU] Dipanggil daemon SETELAH selesai eksekusi 1 automation (apapun
+    """Dipanggil daemon SETELAH selesai eksekusi 1 automation (apapun
     hasilnya, sukses/gagal/dihentikan) -- update penanda 'terakhir jalan'."""
     waktu_epoch = waktu_epoch if waktu_epoch is not None else time.time()
     try:
@@ -290,7 +289,7 @@ def update_last_run(alur_id: str, waktu_epoch: Optional[float] = None):
 
 
 def catat_run(automation_id: str, mulai_at: float, selesai_at: float, status: str, detail: Any) -> str:
-    """[BARU] Simpan 1 baris riwayat eksekusi ke automation_runs.
+    """ Simpan 1 baris riwayat eksekusi ke automation_runs.
     `status`: "SUKSES" | "GAGAL" | "DIHENTIKAN" (goal sudah tercapai di
     tengah jalan, lihat stop_if_output_contains).
     `detail`: apapun yang bisa di-json.dumps (mis. list hasil per step)."""
@@ -310,7 +309,7 @@ def catat_run(automation_id: str, mulai_at: float, selesai_at: float, status: st
 
 
 def ambil_riwayat(automation_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """[BARU] Ambil N riwayat eksekusi terakhir 1 automation, terbaru duluan --
+    """Ambil N riwayat eksekusi terakhir 1 automation, terbaru duluan --
     dipakai panel detail UI buat nampilin histori jalan/gagal."""
     try:
         with sqlite3.connect(sqlite_db_path, timeout=30.0) as conn:

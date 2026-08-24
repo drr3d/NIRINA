@@ -1,4 +1,3 @@
-# File: core_agent/automation_daemon.py
 """
 Daemon TERPISAH dari proses Streamlit UI dan proses agent chat utama.
 Jalankan manual: `python -m core_agent.automation_daemon` (atau sesuaikan
@@ -120,7 +119,7 @@ def _resolve_args(step: Dict[str, Any], hasil_per_step: Dict[int, str]) -> Dict[
 
 
 # ==========================================
-# [BARU] EKSEKUSI 1 STEP "AI TRANSFORM"
+# EKSEKUSI 1 STEP "AI TRANSFORM"
 # ==========================================
 def _eksekusi_ai_transform(step: Dict[str, Any], hasil_per_step: Dict[int, str]) -> str:
     """Ekstrak 1 nilai dari output step sebelumnya pakai llm_extract.
@@ -133,7 +132,7 @@ def _eksekusi_ai_transform(step: Dict[str, Any], hasil_per_step: Dict[int, str])
     bagian_prompt = [_GUARDRAIL_PROMPT_EKSTRAKSI]
 
     target_tool = step.get("target_tool_untuk_konteks")
-    target_param = step.get("target_param_untuk_konteks")  # [BARU]
+    target_param = step.get("target_param_untuk_konteks")
     if target_tool:
         tool_obj = next((t for t in ToolRegistry.get_tools("safe") if t.name == target_tool), None)
         if tool_obj:
@@ -193,7 +192,7 @@ def eksekusi_automation(automation: Dict[str, Any]):
                 "buat ulang lewat UI supaya argumen tool ikut tersimpan."
             )
 
-        i = 0  # [BARU] index manual (bukan for-loop) -- perlu bisa "dilompatin" buat percabangan
+        i = 0  # index manual (bukan for-loop) -- perlu bisa "dilompatin" buat percabangan
         while i < len(steps):
             step = steps[i]
             tipe_step = step.get("type", "tool")  # default "tool" -> backward compat step lama
