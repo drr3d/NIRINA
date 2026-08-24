@@ -5,7 +5,7 @@
 # N.I.R.I.N.A.
 
 > **NaN Intelligent Random Initiator Neuro-Artificial**  
-> A lightweight Agentic AI Framework designed to maximize the capabilities of small-parameter local LLMs through structured reasoning, tool orchestration, and stateful execution.
+> A lightweight Agentic AI Framework designed to maximize the capabilities of local LLMs through structured reasoning, tool orchestration, and stateful execution.
 
 ---
 
@@ -197,6 +197,10 @@ Designed to work with locally hosted models, minimizing dependency on external c
 
 The same Brain can be equipped with completely different Sensors depending on the mission.
 
+### 🛠️ Embedded Functionality
+- Web chat interface
+- RAG Agent knowledge extension
+- Simple Automation
 ---
 
 ## 🚀 Implementations

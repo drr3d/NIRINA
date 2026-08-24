@@ -2,7 +2,7 @@ import streamlit as st
 import uuid
 
 # --- IMPORT MODUL KUSTOM ---
-from views import(tab1_aichat, tab2_knowledge)
+from views import(tab1_aichat, tab2_knowledge, tab3_automation)
 from database.knowledge_db import init_knowledge_db
 from core_agent.config import sqlite_db_path, app_dir
 
@@ -65,8 +65,6 @@ knowledge_dir.mkdir(parents=True, exist_ok=True)
 
 #init_chat_db() # Pastikan tabel DB sudah ada
 init_knowledge_db()
-#init_interview_db()
-#init_lowongan_db()
 
 # 1. Manajemen Daftar Thread (Sesi)
 if "daftar_thread" not in st.session_state:
@@ -115,9 +113,10 @@ if pilihan_sesi != st.session_state.active_thread_id:
 # ==========================================
 # --- LAYOUTING TABS ---
 # ==========================================
-tab1, tab2, = st.tabs([
+tab1, tab2, tab3,= st.tabs([
     "💬 AI Assistant",
     "📚 Knowledge Base",
+    "📅 Automation"
 ])
 
 with tab1:
@@ -125,3 +124,6 @@ with tab1:
 
 with tab2:
     tab2_knowledge.render(sqlite_db_path, knowledge_dir)
+
+with tab3:
+    tab3_automation.render()
