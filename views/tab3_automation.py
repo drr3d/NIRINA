@@ -119,17 +119,26 @@ def _pecah_interval(detik: int) -> tuple:
     return detik, "Detik"
 
 
-def _render_input_manual(nama_param: str, tipe: str, key: str):
+def _render_input_manual(nama_param: str, tipe: str, key: str, default=None):
     """Render widget input yang sesuai tipe parameter -- dipanggil pas user
-    pilih 'Isi Manual' buat 1 argumen."""
+    pilih 'Isi Manual' buat 1 argumen. `default`  -- prefill nilai lama
+    kalau lagi EDIT argumen step yang udah ada (None = kosong, buat step baru)."""
     if tipe == "boolean":
-        return st.checkbox(nama_param, key=key)
+        return st.checkbox(nama_param, value=bool(default) if default is not None else False, key=key)
     elif tipe in ("integer",):
-        return st.number_input(nama_param, step=1, key=key)
+        try:
+            nilai_awal = int(default) if default not in (None, "") else 0
+        except (TypeError, ValueError):
+            nilai_awal = 0
+        return st.number_input(nama_param, step=1, value=nilai_awal, key=key)
     elif tipe in ("number",):
-        return st.number_input(nama_param, key=key)
+        try:
+            nilai_awal = float(default) if default not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            nilai_awal = 0.0
+        return st.number_input(nama_param, value=nilai_awal, key=key)
     else:  # string, atau tipe lain yang gak dikenal -> treat sebagai teks bebas
-        return st.text_input(nama_param, key=key)
+        return st.text_input(nama_param, value=str(default) if default is not None else "", key=key)
 
 
 def render():
@@ -277,6 +286,11 @@ def render():
                 with col_aksi3:
                     if st.button("🗑️ Hapus", key=f"del_{selected_id}", type="primary", use_container_width=True):
                         db.hapus_automation(selected_id)
+
+                        if st.session_state.get("editing_id") == selected_id:
+                            st.session_state.editing_id = None
+                            st.session_state.editing_prefill = {}
+                            st.session_state.alur_draft = []
                         st.toast("Automation dihapus!", icon="🗑️")
                         st.rerun()
                 with col_aksi4:
@@ -327,6 +341,7 @@ def render():
 
     if "alur_draft" not in st.session_state:
         st.session_state.alur_draft = []  # list of dict step, lihat automation_db.tambah_automation utk formatnya
+
 
     key_suffix = f"_edit_{st.session_state.get('editing_id')}" if mode_edit else "_new"
 
@@ -470,6 +485,9 @@ def render():
                      "Kalau gak pilih tool tujuan, sebaiknya diisi biar ekstraksinya presisi.",
             )
 
+            #  Tool tujuan dipilih -> tampilkan parameternya. Kalau lebih
+            # dari 1 parameter, kamu tentuin yang mana diisi hasil AI --
+            # sisanya diisi kayak step tool biasa (manual/dari step lain).
             if ai_target_tool:
                 target_obj = _ambil_tool_by_name(ai_target_tool)
                 skema_target = _skema_param(target_obj)
@@ -526,14 +544,19 @@ def render():
                 "type": "ai_transform",
                 "sumber_step": ai_sumber_step,
                 "target_tool_untuk_konteks": ai_target_tool,
-
+                #  Sebelumnya parameter tujuan (ai_param_terpilih) cuma
+                # dipakai buat nyusun step TOOL sesudahnya, TIDAK disimpen di
+                # step ai_transform ini sendiri -- padahal daemon butuh info
+                # ini buat mempersempit prompt ekstraksi (lihat automation_daemon.py).
                 "target_param_untuk_konteks": ai_param_terpilih,
                 "instruksi": (ai_instruksi or "").strip() or None,
-
+                #  stop_if cuma nempel di SINI kalau TIDAK lanjut ke tool
+                # (kalau lanjut, syaratnya dicek di hasil tool-nya, step berikutnya)
                 "stop_if_output_contains": None if ai_target_tool else (stop_if.strip() or None),
             })
             if ai_target_tool:
-
+                #  Otomatis nambahin step pemanggilan tool tujuan, args
+                # yang dipilih diisi dari step AI Transform yang baru ditambah.
                 args_tool_tujuan = dict(ai_args_lain)
                 if ai_param_terpilih:
                     args_tool_tujuan[ai_param_terpilih] = {"type": "from_step", "step": idx_ai}
@@ -593,7 +616,10 @@ def render():
                     else:
                         st.error("Gak bisa dipindah -- step ini butuh argumen dari step di atasnya, atau ada lompatan yang nyangkut ke rentang ini.")
             with col_del:
-
+                #  Hapus 1 step -- ditolak kalau ada step LAIN yang
+                # bergantung ke step ini (from_step/sumber_step/lompat_jika),
+                # karena hapus itu GESER index semua step sesudahnya, beda
+                # dari reorder (swap) yang cuma tuker posisi 2 step.
                 if st.button("🗑️", key=f"del_step_{i}", use_container_width=True, help="Hapus step ini"):
                     dipakai_oleh = []
                     for j, s2 in enumerate(st.session_state.alur_draft):
@@ -611,6 +637,27 @@ def render():
                         label_dipakai = ", ".join(f"step {j+1}" for j in sorted(set(dipakai_oleh)))
                         st.error(f"Gak bisa dihapus -- dipakai oleh {label_dipakai}. Hapus/ubah itu dulu.")
                     else:
+                        step_dihapus = st.session_state.alur_draft[i]
+                        #  Kalau step yang dihapus ini "pasangan" tool call
+                        # dari 1 step AI Transform sebelumnya (dikenali dari:
+                        # ada argumen from_step yang nunjuk ke step AI Transform
+                        # itu, DAN target_tool_untuk_konteks-nya sama dengan
+                        # tool yang dihapus) -- bersihin konteksnya juga,
+                        # jangan dibiarin nyantol nunjuk ke tool yang udah gak
+                        # ada lagi di alur.
+                        if step_dihapus.get("type") != "ai_transform":
+                            for v in (step_dihapus.get("args") or {}).items():
+                                nama_param_v, spek_v = v
+                                if isinstance(spek_v, dict) and spek_v.get("type") == "from_step":
+                                    idx_ai = spek_v["step"]
+                                    if 0 <= idx_ai < len(st.session_state.alur_draft):
+                                        s_ai = st.session_state.alur_draft[idx_ai]
+                                        if (s_ai.get("type") == "ai_transform"
+                                                and s_ai.get("target_tool_untuk_konteks") == step_dihapus.get("tool")
+                                                and s_ai.get("target_param_untuk_konteks") == nama_param_v):
+                                            s_ai["target_tool_untuk_konteks"] = None
+                                            s_ai["target_param_untuk_konteks"] = None
+
                         st.session_state.alur_draft.pop(i)
                         # Semua referensi (from_step/sumber_step/lompat_jika.ke_step)
                         # yang index-nya LEBIH BESAR dari i ikut digeser -1, biar
@@ -626,14 +673,104 @@ def render():
                                 lj["ke_step"] -= 1
                         st.rerun()
 
+            #  Percabangan: loncat maju kalau hasil step INI cocok syarat.
+            # DIGABUNG dengan edit stop_if di sini juga -- keduanya "syarat
+            # berdasarkan hasil step ini", dan stop_if sebelumnya CUMA bisa
+            # diisi pas nambah step pertama kali, gak bisa diubah/dihapus lagi
+            # setelahnya. Kalau dua-duanya di-set ke kondisi yang SAMA, stop_if
+            # SELALU dicek DULUAN di daemon -- otomatis menang, lompat_jika gak
+            # akan pernah kepakai. Kosongkan salah satu sesuai niatnya.
             lompat_existing = step.get("lompat_jika")
             stop_if_existing = step.get("stop_if_output_contains")
             opsi_tujuan_steps = [j for j in range(len(st.session_state.alur_draft)) if j > i]
             with st.expander(
-                f"⚙️ Syarat step {i+1}"
+                f"⚙️ Edit step {i+1}"
                 + (" -- ADA STOP" if stop_if_existing else "")
                 + (" -- ADA LOMPAT" if lompat_existing else "")
             ):
+
+                st.markdown("**Argumen step ini:**")
+                if step.get("type") == "ai_transform":
+                    opsi_sumber_ai = [j for j in range(len(st.session_state.alur_draft)) if j != i]
+                    if not opsi_sumber_ai:
+                        st.caption("Gak ada step lain yang bisa jadi sumber.")
+                    else:
+                        opsi_label_ai = [_label_step(st.session_state.alur_draft[j], j) for j in opsi_sumber_ai]
+                        default_sumber_idx = opsi_sumber_ai.index(step["sumber_step"]) if step.get("sumber_step") in opsi_sumber_ai else 0
+                        pilihan_sumber_edit = st.selectbox(
+                            "Ambil teks sumber dari:", opsi_label_ai, index=default_sumber_idx, key=f"editarg_sumber_ai_{i}{key_suffix}"
+                        )
+                        sumber_baru = opsi_sumber_ai[opsi_label_ai.index(pilihan_sumber_edit)]
+
+                        daftar_tools_konteks_edit = ["(tidak ada -- cuma ekstrak, gak lanjut manggil tool)"] + sorted(t.name for t in ToolRegistry.get_tools("safe"))
+                        target_lama = step.get("target_tool_untuk_konteks")
+                        default_target_idx = daftar_tools_konteks_edit.index(target_lama) if target_lama in daftar_tools_konteks_edit else 0
+                        pilihan_target_edit = st.selectbox(
+                            "Konteks tool (opsional):", daftar_tools_konteks_edit, index=default_target_idx, key=f"editarg_target_{i}{key_suffix}"
+                        )
+                        target_baru = None if pilihan_target_edit.startswith("(tidak ada") else pilihan_target_edit
+
+                        target_param_baru = step.get("target_param_untuk_konteks")
+                        if target_baru:
+                            target_obj_edit = _ambil_tool_by_name(target_baru)
+                            skema_target_edit = _skema_param(target_obj_edit)
+                            if len(skema_target_edit) == 1:
+                                target_param_baru = next(iter(skema_target_edit))
+                            elif skema_target_edit:
+                                daftar_param_edit = list(skema_target_edit.keys())
+                                default_param_idx = daftar_param_edit.index(target_param_baru) if target_param_baru in daftar_param_edit else 0
+                                target_param_baru = st.selectbox(
+                                    "Argumen mana yang diisi hasil AI:", daftar_param_edit, index=default_param_idx, key=f"editarg_targetparam_{i}{key_suffix}"
+                                )
+                            else:
+                                target_param_baru = None
+                        else:
+                            target_param_baru = None
+
+                        instruksi_baru = st.text_area(
+                            "Instruksi tambahan (opsional):", value=step.get("instruksi") or "", key=f"editarg_instruksi_{i}{key_suffix}"
+                        )
+
+                        if st.button("💾 Simpan Argumen", key=f"editarg_simpan_ai_{i}{key_suffix}", use_container_width=True):
+                            st.session_state.alur_draft[i]["sumber_step"] = sumber_baru
+                            st.session_state.alur_draft[i]["target_tool_untuk_konteks"] = target_baru
+                            st.session_state.alur_draft[i]["target_param_untuk_konteks"] = target_param_baru
+                            st.session_state.alur_draft[i]["instruksi"] = instruksi_baru.strip() or None
+                            st.rerun()
+                else:
+                    tool_obj_edit = _ambil_tool_by_name(step.get("tool"))
+                    skema_edit = _skema_param(tool_obj_edit)
+                    if not skema_edit:
+                        st.caption(f"Tool `{step.get('tool')}` tidak butuh argumen.")
+                    else:
+                        args_baru = {}
+                        for nama_param, tipe in skema_edit.items():
+                            existing_arg = (step.get("args") or {}).get(nama_param, {})
+                            opsi_sumber_edit = ["Isi Manual", "Dari Output Step Sebelumnya"] if i > 0 else ["Isi Manual"]
+                            default_sumber_idx = 1 if (existing_arg.get("type") == "from_step" and i > 0) else 0
+                            sumber_edit = st.radio(
+                                f"Sumber `{nama_param}`:", opsi_sumber_edit, index=default_sumber_idx,
+                                key=f"editarg_sumber_{i}_{nama_param}{key_suffix}", horizontal=True,
+                            )
+                            if sumber_edit == "Isi Manual":
+                                nilai_default = existing_arg.get("value") if existing_arg.get("type") == "manual" else None
+                                nilai = _render_input_manual(nama_param, tipe, key=f"editarg_manual_{i}_{nama_param}{key_suffix}", default=nilai_default)
+                                args_baru[nama_param] = {"type": "manual", "value": nilai}
+                            else:
+                                opsi_step_edit = [j for j in range(len(st.session_state.alur_draft)) if j != i]
+                                opsi_label_edit = [_label_step(st.session_state.alur_draft[j], j) for j in opsi_step_edit]
+                                default_step_idx = opsi_step_edit.index(existing_arg["step"]) if existing_arg.get("type") == "from_step" and existing_arg.get("step") in opsi_step_edit else 0
+                                pilihan_step_edit = st.selectbox(
+                                    f"Ambil `{nama_param}` dari:", opsi_label_edit, index=default_step_idx, key=f"editarg_fromstep_{i}_{nama_param}{key_suffix}"
+                                )
+                                args_baru[nama_param] = {"type": "from_step", "step": opsi_step_edit[opsi_label_edit.index(pilihan_step_edit)]}
+
+                        if st.button("💾 Simpan Argumen", key=f"editarg_simpan_tool_{i}{key_suffix}", use_container_width=True):
+                            st.session_state.alur_draft[i]["args"] = args_baru
+                            st.rerun()
+
+                st.divider()
+
                 if stop_if_existing and lompat_existing:
                     st.warning(
                         "Step ini punya DUA syarat sekaligus -- 'stop' SELALU dicek duluan, "
@@ -643,16 +780,16 @@ def render():
                 stop_if_baru = st.text_input(
                     "Hentikan SELURUH alur kalau hasil step ini mengandung:",
                     value=stop_if_existing or "",
-                    key=f"stopif_edit_{i}",
+                    key=f"stopif_edit_{i}{key_suffix}",
                     placeholder='Kosongkan kalau gak perlu',
                 )
                 col_stop_simpan, col_stop_hapus = st.columns(2)
                 with col_stop_simpan:
-                    if st.button("💾 Simpan Syarat Stop", key=f"stopif_simpan_{i}", use_container_width=True):
+                    if st.button("💾 Simpan Syarat Stop", key=f"stopif_simpan_{i}{key_suffix}", use_container_width=True):
                         st.session_state.alur_draft[i]["stop_if_output_contains"] = stop_if_baru.strip() or None
                         st.rerun()
                 with col_stop_hapus:
-                    if stop_if_existing and st.button("🗑️ Hapus Syarat Stop", key=f"stopif_hapus_{i}", use_container_width=True):
+                    if stop_if_existing and st.button("🗑️ Hapus Syarat Stop", key=f"stopif_hapus_{i}{key_suffix}", use_container_width=True):
                         st.session_state.alur_draft[i]["stop_if_output_contains"] = None
                         st.rerun()
 
@@ -664,19 +801,19 @@ def render():
                     mengandung = st.text_input(
                         "Loncat MAJU kalau hasil step ini mengandung:",
                         value=(lompat_existing or {}).get("mengandung", ""),
-                        key=f"lompat_mengandung_{i}",
+                        key=f"lompat_mengandung_{i}{key_suffix}",
                         placeholder='Misal: "TERKONEKSI"',
                     )
                     opsi_label = [_label_step(st.session_state.alur_draft[j], j) for j in opsi_tujuan_steps]
                     default_idx = 0
                     if lompat_existing and lompat_existing.get("ke_step") in opsi_tujuan_steps:
                         default_idx = opsi_tujuan_steps.index(lompat_existing["ke_step"])
-                    pilihan_tujuan = st.selectbox("Loncat ke:", opsi_label, index=default_idx, key=f"lompat_tujuan_{i}")
+                    pilihan_tujuan = st.selectbox("Loncat ke:", opsi_label, index=default_idx, key=f"lompat_tujuan_{i}{key_suffix}")
                     idx_tujuan = opsi_tujuan_steps[opsi_label.index(pilihan_tujuan)]
 
                     col_simpan, col_hapus = st.columns(2)
                     with col_simpan:
-                        if st.button("💾 Simpan Percabangan", key=f"lompat_simpan_{i}", use_container_width=True):
+                        if st.button("💾 Simpan Percabangan", key=f"lompat_simpan_{i}{key_suffix}", use_container_width=True):
                             if mengandung.strip():
                                 st.session_state.alur_draft[i]["lompat_jika"] = {
                                     "mengandung": mengandung.strip(), "ke_step": idx_tujuan
@@ -685,12 +822,14 @@ def render():
                             else:
                                 st.warning("Isi dulu teks syaratnya.")
                     with col_hapus:
-                        if lompat_existing and st.button("🗑️ Hapus Percabangan", key=f"lompat_hapus_{i}", use_container_width=True):
+                        if lompat_existing and st.button("🗑️ Hapus Percabangan", key=f"lompat_hapus_{i}{key_suffix}", use_container_width=True):
                             st.session_state.alur_draft[i].pop("lompat_jika", None)
                             st.rerun()
 
         if st.button("❌ Reset Alur", use_container_width=True):
             st.session_state.alur_draft = []
+            st.session_state.editing_id = None
+            st.session_state.editing_prefill = {}
             st.rerun()
 
     st.write("")
@@ -702,7 +841,6 @@ def render():
             if not nama_alur:
                 st.error("Nama Automation tidak boleh kosong!")
             else:
-
                 waktu_eksekusi_final = ""
                 if tipe_jadwal == "INTERVAL":
                     multiplier = {"Detik": 1, "Menit": 60, "Jam": 3600, "Hari": 86400}
@@ -718,15 +856,25 @@ def render():
                 else:
 
                     if mode_edit:
-                        db.update_automation(
-                            alur_id=st.session_state.editing_id,
-                            nama_alur=nama_alur,
-                            tipe_jadwal=tipe_jadwal,
-                            waktu_eksekusi=waktu_eksekusi_final,
-                            steps=st.session_state.alur_draft,
-                            depends_on_id=depends_on_id,
-                            depends_on_status=depends_on_status,
-                        )
+                        try:
+                            db.update_automation(
+                                alur_id=st.session_state.editing_id,
+                                nama_alur=nama_alur,
+                                tipe_jadwal=tipe_jadwal,
+                                waktu_eksekusi=waktu_eksekusi_final,
+                                steps=st.session_state.alur_draft,
+                                depends_on_id=depends_on_id,
+                                depends_on_status=depends_on_status,
+                            )
+                        except ValueError:
+                            st.session_state.editing_id = None
+                            st.session_state.editing_prefill = {}
+                            st.session_state.alur_draft = []
+                            st.error(
+                                "Automation ini sudah tidak ada di database (mungkin "
+                                "sudah dihapus). Form edit direset ke kondisi awal."
+                            )
+                            st.stop()
                         st.session_state.editing_id = None
                         st.session_state.editing_prefill = {}
                     else:
@@ -738,7 +886,7 @@ def render():
                             depends_on_id=depends_on_id,
                             depends_on_status=depends_on_status,
                         )
-
+  
                     st.session_state.alur_draft = []
                     st.toast("Automation di-update!" if mode_edit else "Automation berhasil disimpan!", icon="✅")
                     st.rerun()

@@ -57,7 +57,6 @@ _sedang_jalan: set = set()
 
 _waktu_mulai_daemon = time.time()
 
-
 # ==========================================
 # CEK APA SATU AUTOMATION SUDAH WAKTUNYA JALAN
 # ==========================================
@@ -103,7 +102,6 @@ def is_due(automation: Dict[str, Any]) -> bool:
 
     return False
 
-
 # ==========================================
 # RESOLVE 1 ARGUMEN (manual ATAU dari output step lain)
 # ==========================================
@@ -116,7 +114,6 @@ def _resolve_args(step: Dict[str, Any], hasil_per_step: Dict[int, str]) -> Dict[
         else:
             resolved[nama_param] = spek.get("value")
     return resolved
-
 
 # ==========================================
 # EKSEKUSI 1 STEP "AI TRANSFORM"
@@ -166,7 +163,6 @@ def _eksekusi_ai_transform(step: Dict[str, Any], hasil_per_step: Dict[int, str])
     prompt_final = "\n\n".join(bagian_prompt)
     respons = llm_extract.invoke([HumanMessage(content=prompt_final)])
     return str(respons.content).strip()
-
 
 # ==========================================
 # EKSEKUSI 1 AUTOMATION (semua step-nya, berurutan)
@@ -247,7 +243,6 @@ def eksekusi_automation(automation: Dict[str, Any]):
     db.update_last_run(automation_id, selesai_at)
     print(f"[⚡ DAEMON] '{automation['nama_alur']}' selesai -> {status_akhir} ({selesai_at - mulai_at:.1f}s)")
 
-
 def _eksekusi_dengan_guard(automation: Dict[str, Any]):
     """Wrapper -- cegah 1 automation dieksekusi 2x bersamaan."""
     aid = automation["id"]
@@ -288,7 +283,6 @@ def status():
         "sedang_eksekusi": list(_sedang_jalan),
     })
 
-
 @app.route("/run_now/<automation_id>", methods=["POST"])
 def run_now(automation_id):
     automation = db.ambil_satu_automation(automation_id)
@@ -296,7 +290,6 @@ def run_now(automation_id):
         return jsonify({"error": "Automation tidak ditemukan"}), 404
     threading.Thread(target=_eksekusi_dengan_guard, args=(automation,), daemon=True).start()
     return jsonify({"status": "triggered", "nama_alur": automation["nama_alur"]})
-
 
 if __name__ == "__main__":
     db.init_db()
