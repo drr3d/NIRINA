@@ -1,5 +1,5 @@
 from core_agent.registry import ToolRegistry
-from core_agent.agent_factory.factory_skilllib import defaults_kill_lib
+from core_agent.agent_factory.factory_skilllib import secskill_lib
 
 @ToolRegistry.register(category="sensitive") 
 def tools_reward(catatan_hasil: str, skor: int = 60) -> str:
@@ -45,7 +45,7 @@ def lupakan_skill_gagal(nama_tool: str) -> str:
                    (mis. "tanyakan_ke_openrouter"). Harus sama persis dengan
                    nama tool yang terdaftar di ToolRegistry.
     """
-    jumlah = defaults_kill_lib.hapus_skill_terkait_tool(nama_tool, hanya_status="gagal")
+    jumlah = secskill_lib.hapus_skill_terkait_tool(nama_tool, hanya_status="gagal")
     if jumlah == 0:
         return (
             f"Tidak ditemukan catatan skill GAGAL yang menyebut tool '{nama_tool}'. "
@@ -76,7 +76,7 @@ def atur_gorilla_tool_rag(aktif: bool) -> str:
         f"Berlaku mulai giliran berikutnya, tidak memengaruhi percakapan lain."
     )
 
-@ToolRegistry.register(category="sensitive")
+@ToolRegistry.register(category="safe")
 def minta_tool_manual(nama_tool: str) -> str:
     """
     Minta agar SATU tool tertentu (yang kamu tahu/ingat NAMANYA persis, tapi
@@ -103,12 +103,6 @@ def minta_tool_manual(nama_tool: str) -> str:
         nama_tool: nama PERSIS tool yang kamu inginkan (case-sensitive,
             harus sama persis dengan nama tool aslinya).
     """
-    # Validasi SESUNGGUHNYA (apakah tool ini genuinely ada, sudah pernah
-    # diminta, atau sudah kena batas jumlah) terjadi di
-    # GorillaToolSelector.proses_permintaan_tool_manual (dipanggil dari
-    # agent_nodes.py setelah tool ini dieksekusi) -- di sinilah kita cuma
-    # mengecek APAKAH tool itu ada, biar AI dapat feedback yang AKURAT lewat
-    # ToolMessage balasan tool ini sendiri (bukan cuma lewat log server).
     nama_tool = (nama_tool or "").strip()
     nama_semua_tool = {t.name for t in ToolRegistry.get_all_tools()}
  
@@ -128,4 +122,30 @@ def minta_tool_manual(nama_tool: str) -> str:
         f"✅ Tool '{nama_tool}' ditemukan. Tool itu akan dipaksa ikut "
         f"ter-bind mulai GILIRAN BERIKUTNYA untuk sisa task ini -- silakan "
         f"panggil tool itu langsung di giliranmu selanjutnya."
+    )
+
+@ToolRegistry.register(category="safe")  # 
+def lihat_katalog_tools() -> str:
+    """Tampilkan daftar SEMUA tool yang terdaftar di sistem beserta ringkasan
+    docstring-nya (bukan cuma tool yang lolos seleksi Tool-RAG saat ini).
+ 
+    KAPAN PAKAI INI: kalau kamu butuh tahu tool APA SAJA yang tersedia
+    sebelum memutuskan mau pakai tool spesifik yang mana -- misalnya kamu
+    sedang menyusun rencana multi-langkah dan langkah pertamanya adalah
+    "kumpulkan/tentukan tools yang dibutuhkan". Tool ini TIDAK melakukan
+    aksi apapun (baca-baca saja), aman dipanggil kapan saja.
+ 
+    Setelah tahu nama tool yang kamu perlukan dari daftar ini, panggil tool
+    itu langsung kalau sudah ada di daftar tool yang bisa kamu panggil
+    sekarang, atau panggil `minta_tool_manual` dengan nama tool tersebut
+    kalau ternyata belum ada di daftar yang bisa kamu panggil saat ini.
+    """
+    semua = sorted(ToolRegistry.get_all_tools(), key=lambda t: t.name)
+    baris = []
+    for t in semua:
+        ringkas = (t.description or "").strip().splitlines()[0] if t.description else "(tanpa deskripsi)"
+        baris.append(f"- {t.name}: {ringkas[:150]}")
+    return (
+        f"Daftar semua tool terdaftar di sistem ({len(semua)} tool):\n"
+        + "\n".join(baris)
     )

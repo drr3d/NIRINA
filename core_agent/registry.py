@@ -6,7 +6,7 @@ from collections import defaultdict
 import chromadb
 from chromadb.utils import embedding_functions
 
-default_tools = {"tools_reward", "tools_gagal", "tools_batal", "lupakan_skill_gagal"} # consider move this to config.json
+default_tools = {}# {"tools_reward", "tools_gagal", "tools_batal", "lupakan_skill_gagal"} # consider move this to config.json
 class ToolRegistry:
     """Registry framework dinamis dengan Backward Compatibility penuh + Tool-RAG."""
     _tools = defaultdict(list)
@@ -65,7 +65,7 @@ class ToolRegistry:
         return all_tools
 
     # =========================================================
-    # FITUR BARU: SINKRONISASI & PENCARIAN ALAT (AMAN & TERPISAH)
+    # SINKRONISASI & PENCARIAN ALAT (AMAN & TERPISAH)
     # =========================================================
     @classmethod
     def sync_tools_to_db(cls):
@@ -163,7 +163,9 @@ class ToolRegistry:
         if not overlap_nama:
             return None
             
-        # 1. Syarat Cakupan Mayoritas (Sangat ketat, 80% token nama tool harus ada di kueri)
+        # 1. Syarat Cakupan Mayoritas (mayoritas token nama tool harus ada di
+        # kueri -- ambang aktual dikontrol parameter `ambang_cakupan`, default
+        # 0.66 alias 66%)
         cakupan = len(overlap_nama) / len(nama_tokens) if nama_tokens else 0
         if cakupan >= ambang_cakupan:
             return "kuat"
@@ -176,15 +178,18 @@ class ToolRegistry:
             # Jika nama tool pendek (1-2 kata), 1 token unik panjang sudah cukup untuk jadi bukti kuat
             if len(nama_tokens) <= 2:
                 return "kuat"
-            # Jika nama tool panjang (3 kata atau lebih), butuh setidaknya 2 token overlap agar tidak salah tangkap
-            elif len(overlap_nama) >= 2:
-                return "kuat"
+            else:
+                overlap_bermakna = [tok for tok in overlap_nama if len(tok) > 3]
+                if len(overlap_bermakna) >= 2:
+                    return "kuat"
                 
         # Jika gagal melewati syarat ketat di atas, turunkan kasta menjadi "lemah"
         return "lemah"
 
     @classmethod
-    def get_relevant_tools(cls, task_query: str, top_k: int = 3, bobot_semantic: float = 0.65):
+    def get_relevant_tools(cls, task_query: str, top_k: int = 3, 
+                           bobot_semantic: float = 0.65, 
+                           ambang_df: int = 1, ambang_cakupan: float = 0.75):
         """[HYBRID] Filter dinamis tool untuk disuapkan ke LLM -- gabungan semantic
         search (ChromaDB embedding, nangkep kemiripan MAKNA) + lexical/keyword
         exact-match (nangkep istilah teknis SPESIFIK yang sering dilewatkan
@@ -220,7 +225,7 @@ class ToolRegistry:
         df_token = cls._hitung_df_token_nama(all_public_tools)
         nama_exact_kuat, nama_exact_lemah = set(), set()
         for t in all_public_tools:
-            klasifikasi = cls._klasifikasi_exact_match(query_tokens, t, df_token)
+            klasifikasi = cls._klasifikasi_exact_match(query_tokens, t, df_token, ambang_df, ambang_cakupan)
             if klasifikasi == "kuat":
                 nama_exact_kuat.add(t.name)
             elif klasifikasi == "lemah":
@@ -313,10 +318,6 @@ class FailsafeRegistry:
     """
     _handlers = {}
 
-    # Kode bawaan yang dikenali graf inti. Kontributor bebas mendaftarkan kode
-    # baru sendiri (string apa saja) kalau suatu saat menambah node failsafe
-    # lain -- tidak wajib didaftarkan di sini, ini cuma referensi baku biar
-    # tidak typo saat register/pemanggilan.
     KODE_KOSONG = "kosong"
 
     @classmethod
@@ -425,35 +426,7 @@ class GuardrailRegistry:
         except Exception as e:
             print(f"⚠️ [GuardrailRegistry] Handler validasi kategori '{kategori}' error, tool LOLOS default. Detail: {e}")
             return None
-
-
 class SmokeTestRegistry:
-    """
-    Registry buat smoke test otomatis yang dijalankan tulis_file SEBELUM
-    revisi kode dari agent benar-benar disimpan permanen ke disk. Beda dari
-    FailsafeRegistry (urusannya respons LLM yang gagal), ini urusannya
-    validasi KODE HASIL TULISAN LLM -- lapisan pertahanan tambahan karena
-    model kecil bisa nulis kode yang sintaksnya benar tapi salah runtime
-    (argumen kurang, API ketuker, dsb) dan itu cuma ketahuan begitu benar-benar
-    dieksekusi.
- 
-    Kontributor daftar smoke test PER NAMA FILE (bukan per tool) di file
-    plugin masing-masing:
- 
-        from core_agent.registry import SmokeTestRegistry
- 
-        @SmokeTestRegistry.register("sqllogin.py")
-        def tes_sqllogin(modul):
-            # `modul` = module Python hasil importlib.reload() dari file yang
-            # BARU ditulis (belum permanen -- tulis_file akan rollback kalau
-            # test ini gagal). Lempar Exception/assert apapun kalau gagal.
-            hasil = modul.verifikasi_login("admin", "rahasia123")
-            assert "LOGIN_SUKSES" in hasil, f"Login normal harus tetap sukses: {hasil}"
- 
-    Kalau tidak ada test terdaftar untuk sebuah file, tulis_file tetap jalan
-    normal tanpa validasi tambahan (opt-in per file, tidak mengubah perilaku
-    file yang belum ada test-nya).
-    """
     _tests = {}
  
     @classmethod
