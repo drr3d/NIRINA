@@ -2,7 +2,7 @@ import streamlit as st
 import uuid
 
 # --- IMPORT MODUL KUSTOM ---
-from views import(tab1_aichat, tab2_knowledge, tab3_automation)
+from views import(tab1_aichat, tab2_knowledge, tab3_automation, tab4_voyager)
 from database.knowledge_db import init_knowledge_db
 from core_agent.config import sqlite_db_path, app_dir
 
@@ -59,7 +59,6 @@ st.sidebar.info(f"Aktif sebagai: **{st.session_state.user_role}** ({st.session_s
 # ==========================================
 # --- INISIALISASI SESSION STATE & DB ---
 # ==========================================
-# [NEW UPGRADE]: Folder untuk menyimpan dokumen fisik HR Knowledge
 knowledge_dir = app_dir / "knowledge_docs"
 knowledge_dir.mkdir(parents=True, exist_ok=True)
 
@@ -99,11 +98,8 @@ pilihan_sesi = st.sidebar.selectbox(
 )
 
 # 3. Logika Perpindahan Sesi
-# 3. Logika Perpindahan Sesi (Thread)
 if pilihan_sesi != st.session_state.active_thread_id:
     st.session_state.active_thread_id = pilihan_sesi
-    
-    # [MITIGASI KONFLIK]: Pembersihan sisa interaksi saat pindah thread
     st.session_state.menunggu_approval = False
     st.session_state.data_approval = None
     
@@ -113,10 +109,11 @@ if pilihan_sesi != st.session_state.active_thread_id:
 # ==========================================
 # --- LAYOUTING TABS ---
 # ==========================================
-tab1, tab2, tab3,= st.tabs([
+tab1, tab2, tab3, tab4, = st.tabs([
     "💬 AI Assistant",
     "📚 Knowledge Base",
-    "📅 Automation"
+    "📅 Automation",
+    "🌐 Voyager Viz"
 ])
 
 with tab1:
@@ -127,3 +124,6 @@ with tab2:
 
 with tab3:
     tab3_automation.render()
+
+with tab4:
+    tab4_voyager.render()

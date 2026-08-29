@@ -1,5 +1,5 @@
 import streamlit as st
-from core_agent.agent_graph import proses_chat_agent
+from core_agent.agent_runner import proses_chat_agent
 
 # ------------------------------------------
 # TAB 1: AI ASSISTANT
@@ -44,50 +44,47 @@ def render():
             
             col1, col2 = st.columns(2)
             with col1:
-                # [KOREKSI 1] Gunakan width="stretch" sesuai standar Streamlit terbaru
                 if st.button("✅ Setujui & Lanjutkan", width="stretch"):
                     approval_ui.empty() 
                     with chat_container:
                         with st.chat_message("assistant"):
-                            with st.spinner("AI sedang mengeksekusi tindakan (otomatis meneruskan jika berantai)..."):
-                                
-                                # [KOREKSI 2] Gunakan is_approval=True sesuai fungsi backend asli Anda
+                            with st.spinner("AI sedang mengeksekusi tindakan (otomatis meneruskan kalau tool berikutnya sama)..."):
+                                nama_tool_disetujui = data.get("tool") if data else None
+
                                 hasil = proses_chat_agent(
                                             is_approval=True, 
                                             thread_id=st.session_state.active_thread_id,
                                             user_role=st.session_state.user_role
                                         )
-                                
-                                # Bypass persetujuan berantai
-                                while hasil.get("status") == "butuh_persetujuan":
+
+                                while (
+                                    hasil.get("status") == "butuh_persetujuan"
+                                    and hasil.get("tool") == nama_tool_disetujui
+                                ):
                                     hasil = proses_chat_agent(
                                                 is_approval=True, 
                                                 thread_id=st.session_state.active_thread_id,
                                                 user_role=st.session_state.user_role
                                             )
-                                
-                                pesan_final = hasil.get("pesan", "")
-                                st.markdown(pesan_final)
-                                
-                                st.session_state.messages.append({
-                                    "role": "assistant", 
-                                    "content": pesan_final,
-                                    "download_file": hasil.get("download_info")
-                                })
-                                
-                                st.session_state.menunggu_approval = False
-                                st.session_state.data_approval = None
-                                st.rerun()
+
+                                if hasil.get("status") == "butuh_persetujuan":
+                                    st.session_state.menunggu_approval = True
+                                    st.session_state.data_approval = hasil
+                                else:
+                                    pesan_final = hasil.get("pesan", "")
+                                    st.markdown(pesan_final)
+
+                                    st.session_state.messages.append({
+                                        "role": "assistant", 
+                                        "content": pesan_final,
+                                        "download_file": hasil.get("download_info")
+                                    })
+
+                                    st.session_state.menunggu_approval = False
+                                    st.session_state.data_approval = None
+                    st.rerun()
             
             with col2:
-                # [FIX] Tombol ini WAJIB memanggil backend, bukan cuma reset state
-                # Streamlit -- kalau tidak, checkpoint LangGraph di SQLite tetap
-                # nyangkut permanen di titik interrupt (node_sensitive/node_pentest),
-                # walau tampilan UI-nya sudah "pura-pura" balik normal. Memanggil
-                # proses_chat_agent(is_approval=False, ...) memicu logika abort yang
-                # sudah ada di AgentSession.run() (agent_graph.py): tool_call yang
-                # pending dijawab dengan ToolMessage "SYSTEM ABORT", lalu AI lanjut
-                # dengan instruksi baru -- BUKAN mematikan seluruh sesi.
                 if st.button("❌ Batalkan", type="primary", width="stretch"):
                     approval_ui.empty()
                     with chat_container:

@@ -296,20 +296,6 @@ def replace_atau_tambah(existing: list, new) -> list:
         return []          # None = sinyal reset
     return existing + new  # list = nambah
 
-# Tool "meta"/administratif -- BUKAN bagian dari resep cara menyelesaikan
-# suatu task (toggle Tool-RAG per sesi, minta tool manual, sinyal
-# reward/gagal/batal, catat/cari insight, dst). SENGAJA dikecualikan dari
-# current_skill_trace (lihat AIBrainProcessor._bangun_update_state) supaya:
-#   1. Trace yang tersimpan ke skill_library cuma berisi tool yang GENUINELY
-#      relevan dgn cara menyelesaikan task itu (bukan noise bookkeeping).
-#   2. Skill Injector (GorillaToolSelector.pilih_llm, sumber_tag=
-#      "skill_injector") tidak ikut memaksa tool administratif ini ter-bind
-#      di task-task mendatang yang mirip -- itu bukan langkah domain yang
-#      perlu diulang tiap kali task sejenis muncul.
-# tools_reward/tools_gagal sendiri TIDAK perlu dimasukkan ke set ini --
-# keduanya sudah otomatis terkecualikan lewat urutan eksekusi (giliran
-# penutup dibaca SEBELUM current_skill_trace-nya sendiri ter-update, lihat
-# _proses_sinyal_tool_khusus & SkillLibraryOrchestrator.simpan_skill).
 NAMA_TOOL_META_BUKAN_BAGIAN_TRACE = {
     "tools_batal",
     "atur_gorilla_tool_rag",
@@ -338,6 +324,7 @@ class AgentState(TypedDict):
      # ---Skill Library (Voyager-style) ---
     current_task_desc: str                              # diisi user saat kasih task baru (dipotong [:300], khusus skill library)
     current_task_desc_full: str                          # versi UTUH (tidak dipotong), khusus query Tool-RAG
+    id_toolmsg_reward_terproses: Optional[str]   # tool_call_id ToolMessage tools_reward/gagal/batal TERAKHIR yang sudah diproses _cek_hasil_hitl_reward -- guard biar nggak diproses ulang tiap giliran selama ToolMessage-nya masih nangkring di riwayat
     id_pesan_task_aktif: Optional[str]                    # id HumanMessage anchor task ini -- dilindungi dari State Cleaner selama task masih aktif
     baru_saja_tutup_task: bool  # True HANYA utk giliran PERTAMA setelah task ditutup via tools_reward/tools_gagal/tools_batal -- dipakai _bangun_query_rag utk cegah "Konteks terakhir" ikut narik teks penutup task yang sudah closed. Direset ke False lagi di giliran berikutnya.
     mode_eksplorasi: Optional[bool]                       # diputuskan SEKALI di awal task -- True = referensi skill sukses SENGAJA disembunyikan (dorong eksplorasi jalur baru)
@@ -1195,6 +1182,7 @@ class AIBrainProcessor:
                 )
 
             # --- TAMBAHAN UNTUK RESET/BATAL ---
+            """
             if nama_tool == "tools_batal":
                 print("[Skill Library] 🧹 Membatalkan dan mereset jejak task yang menggantung.")
                 update_state.update(SkillLibraryOrchestrator.reset_task_state())
@@ -1209,6 +1197,7 @@ class AIBrainProcessor:
                     )
                 )
                 update_state.update(GorillaToolSelector.reset_tool_manual())
+            """
 
     def _bangun_update_state(
         self, *, response, ringkasan_baru, revision_count,
@@ -1301,6 +1290,60 @@ class AIBrainProcessor:
 
         return update_state
 
+    def _cek_hasil_hitl_reward(self, messages_raw, current_task_desc, current_skill_trace,
+                            current_rag_candidates_trace, id_toolmsg_reward_terproses):
+        """Cek apakah pesan TERAKHIR di riwayat itu ToolMessage jawaban dari
+        tools_reward/tools_gagal/tools_batal yang BELUM diproses. Kalau iya:
+        - Kalau isinya SYSTEM ABORT -> user batalin, JANGAN simpan apa-apa,
+            JANGAN reset task (biarkan task tetap jalan, AI bisa lanjut/ralat).
+        - Kalau isinya sinyal asli dari tool -> BARU sekarang simpan_skill()
+            dipanggil & task di-reset -- karena ini titik di mana approval-nya
+            sudah pasti clear.
+        id_toolmsg_reward_terproses: tool_call_id terakhir yang SUDAH diproses --
+        guard biar nggak diproses ulang tiap giliran (ToolMessage-nya tetap
+        nangkring di riwayat selama beberapa turn ke depan).
+        """
+        from langchain_core.messages import ToolMessage
+        if not messages_raw or not isinstance(messages_raw[-1], ToolMessage):
+            return {}
+        msg = messages_raw[-1]
+        if msg.name not in ("tools_reward", "tools_gagal", "tools_batal"):
+            return {}
+        if msg.tool_call_id == id_toolmsg_reward_terproses:
+            return {}  # sudah pernah diproses, skip
+
+        isi = str(msg.content or "")
+        update = {"id_toolmsg_reward_terproses": msg.tool_call_id}
+
+        if isi.startswith("SYSTEM ABORT"):
+            print(f"[Skill Library] 🚫 {msg.name} DIBATALKAN user via HITL -- skip simpan_skill, task TETAP lanjut.")
+            return update  # nggak reset apa-apa, task lanjut seperti biasa
+
+        if msg.name == "tools_batal":
+            print("[Skill Library] 🧹 tools_batal disetujui -- reset jejak task.")
+            update.update(SkillLibraryOrchestrator.reset_task_state())
+            return update
+
+        # tools_reward / tools_gagal disetujui -> cari args ASLI dari AIMessage
+        # yang punya tool_calls dgn id yang sama, baru simpan_skill() beneran
+        args_asli = {}
+        for m in reversed(messages_raw):
+            if hasattr(m, "tool_calls") and m.tool_calls:
+                for tc in m.tool_calls:
+                    if tc.get("id") == msg.tool_call_id:
+                        args_asli = tc.get("args", {})
+                        break
+                if args_asli:
+                    break
+
+        update.update(
+            self._skills.simpan_skill(
+                msg.name, args_asli, current_task_desc, current_skill_trace,
+                current_rag_candidates_trace,
+            )
+        )
+        return update
+
     # ==========================================
     # --- Entry point utama ---
     # ==========================================
@@ -1308,15 +1351,18 @@ class AIBrainProcessor:
         """
         Entry point yang dieksekusi oleh LangGraph. Setiap langkah
         didelegasikan ke method/kelas spesialisasinya masing-masing:
-          1. Bersihkan sampah pesan & pasang system prompt statis (KV-cache).
-          2. Optimasi/kompresi konteks + tempel reminder sementara.
-          3. Deteksi anchor task baru (dipakai skill library & Tool-RAG).
-          4. Siapkan konteks skill library (retrieval, mode eksplorasi).
-          5. Safety-net: pastikan selalu ada HumanMessage di prompt.
-          6. Pilih tool relevan (Tool-RAG Gorilla, termasuk tool manual
-             override dari minta_tool_manual) lalu panggil LLM.
-          7. Susun update_state balasan (trace, task desc, guard, dst).
-          8. Bersihkan pesan usang dari SQLite (state cleaner).
+        0. [BARU] Cek apakah giliran SEBELUMNYA ada tools_reward/gagal/batal
+            yang baru kejawab (disetujui/dibatalkan via HITL) -- proses efek
+            sampingnya (simpan_skill/reset) DI SINI, bukan pas AI manggilnya.
+        1. Bersihkan sampah pesan & pasang system prompt statis (KV-cache).
+        2. Optimasi/kompresi konteks + tempel reminder sementara.
+        3. Deteksi anchor task baru (dipakai skill library & Tool-RAG).
+        4. Siapkan konteks skill library (retrieval, mode eksplorasi).
+        5. Safety-net: pastikan selalu ada HumanMessage di prompt.
+        6. Pilih tool relevan (Tool-RAG Gorilla, termasuk tool manual
+            override dari minta_tool_manual) lalu panggil LLM.
+        7. Susun update_state balasan (trace, task desc, guard, dst).
+        8. Bersihkan pesan usang dari SQLite (state cleaner).
         """
         messages_raw = list(state.get("messages", []))
         messages = self._bersihkan_pesan_ai_kosong(messages_raw)
@@ -1336,6 +1382,28 @@ class AIBrainProcessor:
         mode_eksplorasi_tersimpan = state.get("mode_eksplorasi", None)
         id_pesan_task_aktif = state.get("id_pesan_task_aktif", None)
         gorilla_aktif_override = state.get("gorilla_aktif_override", None)
+        id_toolmsg_reward_terproses = state.get("id_toolmsg_reward_terproses", None)  # [BARU]
+
+        # 0. [BARU] Cek hasil approval HITL utk tools_reward/gagal/batal giliran
+        # lalu -- simpan_skill() beneran BARU dipanggil DI SINI kalau disetujui,
+        # SKIP total kalau dibatalkan (lihat _cek_hasil_hitl_reward).
+        update_hitl_reward = self._cek_hasil_hitl_reward(
+            messages_raw, current_task_desc, current_skill_trace,
+            current_rag_candidates_trace, id_toolmsg_reward_terproses,
+        )
+        # Terapkan ke variabel lokal SEBELUM langkah-langkah berikutnya, supaya
+        # _deteksi_task_baru dkk sudah lihat versi current_task_desc/
+        # current_skill_trace yang ter-update (bukan versi basi dari state lama).
+        if "current_task_desc" in update_hitl_reward:
+            current_task_desc = update_hitl_reward["current_task_desc"]
+        if "current_task_desc_full" in update_hitl_reward:
+            current_task_desc_full = update_hitl_reward["current_task_desc_full"]
+        if "current_skill_trace" in update_hitl_reward:
+            current_skill_trace = update_hitl_reward.get("current_skill_trace") or []
+        if "current_rag_candidates_trace" in update_hitl_reward:
+            current_rag_candidates_trace = update_hitl_reward.get("current_rag_candidates_trace") or []
+        if "id_pesan_task_aktif" in update_hitl_reward:
+            id_pesan_task_aktif = update_hitl_reward["id_pesan_task_aktif"]
 
         # 1. System prompt statis + 2. optimasi konteks + reminder
         messages = self._pasang_system_prompt(messages)
@@ -1346,7 +1414,7 @@ class AIBrainProcessor:
 
         # 3. Anchor task baru
         (task_desc_baru, current_task_desc, current_task_desc_full,
-         id_pesan_task_aktif, human_msg_lengkap_untuk_rag) = self._deteksi_task_baru(
+        id_pesan_task_aktif, human_msg_lengkap_untuk_rag) = self._deteksi_task_baru(
             messages_raw, current_skill_trace, current_task_desc,
             current_task_desc_full, id_pesan_task_aktif,
         )
@@ -1396,10 +1464,12 @@ class AIBrainProcessor:
             current_rag_candidates_trace=current_rag_candidates_trace,
         )
 
-        # 8. State Cleaner (SQLite)
-        update_state = self._bersihkan_pesan_lama(state, update_state, id_pesan_task_aktif)
+        update_final = {**update_hitl_reward, **update_state}
 
-        return update_state
+        # 8. State Cleaner (SQLite)
+        update_final = self._bersihkan_pesan_lama(state, update_final, id_pesan_task_aktif)
+
+        return update_final
 
     def __call__(self, state: AgentState) -> dict:
         return self._orchestrator(state)

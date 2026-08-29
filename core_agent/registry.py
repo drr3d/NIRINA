@@ -6,7 +6,9 @@ from collections import defaultdict
 import chromadb
 from chromadb.utils import embedding_functions
 
-default_tools = {}# {"tools_reward", "tools_gagal", "tools_batal", "lupakan_skill_gagal"} # consider move this to config.json
+# {"tools_reward", "tools_gagal", "tools_batal", "lupakan_skill_gagal"} # consider move this to config.json
+default_tools = set() # Jika default tools mau diisi, maka gunakan format dict seperti diatas
+
 class ToolRegistry:
     """Registry framework dinamis dengan Backward Compatibility penuh + Tool-RAG."""
     _tools = defaultdict(list)
@@ -426,6 +428,8 @@ class GuardrailRegistry:
         except Exception as e:
             print(f"⚠️ [GuardrailRegistry] Handler validasi kategori '{kategori}' error, tool LOLOS default. Detail: {e}")
             return None
+
+
 class SmokeTestRegistry:
     _tests = {}
  
