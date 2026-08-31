@@ -26,8 +26,9 @@ def _proses_data(db_path: str, collection_name: str, min_cluster_size: int,
         ollama_model=ollama_model, st_model_name=st_model_name,
     )
     ids, docs, metas, embeddings = ambil_data_skill(db_path, collection_name, embedding_fn=embed_fn)
-    koordinat_2d, label_cluster = cluster_task_desc(embeddings, min_cluster_size)
-    return docs, metas, koordinat_2d, label_cluster
+
+    koordinat_2d, label_cluster, catatan_cluster = cluster_task_desc(embeddings, min_cluster_size)
+    return docs, metas, koordinat_2d, label_cluster, catatan_cluster
  
  
 def render():
@@ -69,20 +70,25 @@ def render():
  
     try:
         with st.spinner("Mengambil data & menghitung ulang embedding + cluster..."):
-            docs, metas, koordinat_2d, label_cluster = _proses_data(
+            docs, metas, koordinat_2d, label_cluster, catatan_cluster = _proses_data(
                 db_path, collection_name, min_cluster_size,
                 embed_backend, ollama_base_url, ollama_model, st_model_name,
             )
     except RuntimeError as e:
+
         st.warning(str(e))
         return
     except Exception as e:
+
         st.error(f"Gagal memuat skill library: {e}")
         return
  
     if len(docs) == 0:
         st.info("Skill library masih kosong -- belum ada trace buat divisualisasikan.")
         return
+
+    if catatan_cluster:
+        st.info(f"ℹ️ {catatan_cluster}")
  
     # ==========================================
     # FILTER

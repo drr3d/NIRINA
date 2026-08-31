@@ -9,12 +9,6 @@ from pyvis.network import Network
 import chromadb
 from chromadb.utils import embedding_functions
 
-# ==========================================
-# EMBEDDING BACKEND FACTORY
-# (disalin dari skill_lib.py -- dipakai buat RE-EMBED task_desc di sini,
-# BUKAN baca embeddings tersimpan dari Chroma. Lihat catatan di
-# ambil_data_skill() kenapa.)
-# ==========================================
 def buat_embedding_fn(
     backend: str = "ollama",
     ollama_base_url: str = "http://localhost:11434",
@@ -49,7 +43,7 @@ WARNA_JEMBATAN = "#ffd700"  # edge yang dipakai lintas cluster
 def warna_untuk_cluster(cid: int) -> str:
     if cid < 0:
         return WARNA_NOISE
-    return PALET_WARNA[cid % len(PALET_WARNA)]
+    return PALET_WARNA[int(cid) % len(PALET_WARNA)]
 
 def _lerp(a, b, t):
     return a + (b - a) * t
@@ -75,28 +69,14 @@ def rasio_sukses(status_count: dict) -> float:
 # 1. AMBIL DATA DARI CHROMADB
 # ==========================================
 def ambil_data_skill(db_path: str, collection_name: str, embedding_fn=None):
-    """
-    SENGAJA cuma include=["documents","metadatas"] -- PERSIS kayak
-    skilllib_viewer.py kamu. Minta "embeddings" balik dari Chroma itu yang
-    memicu Chroma nyoba baca vector dari index HNSW biner berdasarkan id --
-    kalau ada 1 aja id yang vector-nya "orphan"/rusak di index itu (biasanya
-    dari penulisan yang sempat ke-interrupt), Chroma lempar
-    "Internal error: Error finding id" dan GAGAL TOTAL, bukan skip id itu
-    doang. skilllib_viewer.py nggak pernah kena ini karena dia emang nggak
-    pernah minta embeddings.
 
-    Solusinya: re-embed task_desc di sini pakai embedding_fn yang sama
-    (default: backend Ollama sama kayak skill_lib.py), bukan gantungin ke
-    embeddings yang tersimpan. Efeknya butuh sedikit waktu ekstra buat
-    embed ulang, tapi nggak nyentuh titik yang error sama sekali.
-    """
     client = chromadb.PersistentClient(path=db_path)
     col = client.get_or_create_collection(name=collection_name)
     hasil = col.get(include=["documents", "metadatas"])
 
-    ids = hasil["ids"]
-    docs = hasil["documents"]
-    metas = hasil["metadatas"]
+    ids = hasil.get("ids") or []
+    docs = hasil.get("documents") or []
+    metas = hasil.get("metadatas") or []
 
     if not docs:
         raise RuntimeError(
@@ -104,36 +84,144 @@ def ambil_data_skill(db_path: str, collection_name: str, embedding_fn=None):
             "(samain kayak di skilllib_viewer.py kamu)."
         )
 
+    n_selaras = min(len(ids), len(docs), len(metas))
+    if n_selaras < len(docs):
+        ids, docs, metas = ids[:n_selaras], docs[:n_selaras], metas[:n_selaras]
+
+    docs = [d if (isinstance(d, str) and d.strip()) else "(task_desc kosong)" for d in docs]
+    metas = [m if isinstance(m, dict) else {} for m in metas]
+
     embed_fn = embedding_fn or buat_embedding_fn(backend="ollama")
-    embeddings = np.array(embed_fn(docs))
+    embeddings = np.array(embed_fn(docs), dtype=float)
+
+    if not np.isfinite(embeddings).all():
+        raise RuntimeError(
+            "Embedding hasil re-embed mengandung NaN/Inf -- kemungkinan "
+            "backend embedding (Ollama/Sentence-Transformers) gagal/timeout "
+            "di tengah jalan. Cek server embedding-nya lalu 'Refresh Visualisasi' lagi."
+        )
 
     return ids, docs, metas, embeddings
 
 # ==========================================
 # 2. CLUSTERING (UMAP + HDBSCAN)
 # ==========================================
+def _layout_lingkaran(jumlah: int) -> np.ndarray:
+    """Fallback layout kalau UMAP nggak dipakai/gagal -- sekadar sebar titik
+    di lingkaran biar nggak numpuk di satu koordinat dan tetap kebaca."""
+    if jumlah <= 0:
+        return np.empty((0, 2))
+    if jumlah == 1:
+        return np.array([[0.0, 0.0]])
+    angles = np.linspace(0, 2 * np.pi, jumlah, endpoint=False)
+    return np.column_stack([np.cos(angles), np.sin(angles)])
+
+
 def cluster_task_desc(embeddings: np.ndarray, min_cluster_size: int = 3):
+    """
+    Proyeksi 2D (UMAP) + clustering (HDBSCAN) dari embedding task_desc.
+
+    Didesain supaya TIDAK PERNAH melempar exception ke pemanggil untuk kasus
+    "data kurang/degenerate" -- kasus itu bukan bug, cuma butuh fallback.
+    Exception cuma naik untuk hal yang genuinely nggak bisa di-recover (mis.
+    array input rusak total).
+
+    Edge case yang ditangani:
+      - n == 0                -> array kosong.
+      - n == 1..3              -> UMAP butuh n_neighbors < n_samples secara
+                                   ketat dan hasilnya nggak bermakna buat
+                                   sample sesedikit ini; skip UMAP, pakai
+                                   layout lingkaran, semua ditandai noise.
+      - UMAP gagal fit         -> (mis. "zero-size array... reduction
+                                   operation maximum" -- biasanya krn banyak
+                                   embedding IDENTIK/nyaris identik sehingga
+                                   k-NN graph-nya degenerate dan spectral
+                                   init UMAP gagal) ditangkap, fallback ke
+                                   layout lingkaran, TIDAK crash total.
+      - min_cluster_size > n   -> di-clamp otomatis biar HDBSCAN nggak error.
+      - HDBSCAN gagal fit      -> fallback: semua noise, koordinat UMAP tetap dipakai.
+
+    Return: (koordinat_2d, label_cluster, catatan)
+      `catatan` None kalau normal, atau string singkat penjelasan fallback
+      yang dipakai -- ditampilkan sebagai st.info() di UI supaya user tahu
+      ini kondisi "data belum cukup", bukan silent/error.
+    """
+    n = len(embeddings)
+
+    if n == 0:
+        return np.empty((0, 2)), np.empty((0,), dtype=int), None
+
+    embeddings = np.asarray(embeddings, dtype=float)
+    if not np.isfinite(embeddings).all():
+        # Harusnya sudah ketangkep di ambil_data_skill(), ini jaring pengaman kedua.
+        raise RuntimeError("Embedding mengandung NaN/Inf -- tidak bisa di-cluster.")
+
+    MIN_SAMPLES_UNTUK_UMAP = 4
+    if n < MIN_SAMPLES_UNTUK_UMAP:
+        koordinat_2d = _layout_lingkaran(n)
+        label_cluster = np.full(n, -1, dtype=int)
+        catatan = (
+            f"Cuma {n} skill di library -- clustering butuh minimal "
+            f"{MIN_SAMPLES_UNTUK_UMAP} task biar bermakna. Titik ditampilkan "
+            "dengan layout sederhana, tanpa proyeksi UMAP/pengelompokan."
+        )
+        return koordinat_2d, label_cluster, catatan
+
     import umap
     import hdbscan
 
-    n = len(embeddings)
     n_neighbors = max(2, min(15, n - 1))
 
-    reducer_2d = umap.UMAP(n_neighbors=n_neighbors, n_components=2, random_state=42)
-    koordinat_2d = reducer_2d.fit_transform(embeddings)
+    try:
+        reducer_2d = umap.UMAP(n_neighbors=n_neighbors, n_components=2, random_state=42)
+        koordinat_2d = reducer_2d.fit_transform(embeddings)
+        if not np.isfinite(koordinat_2d).all():
+            raise ValueError("UMAP menghasilkan koordinat non-finite (NaN/Inf).")
+    except Exception as e:
 
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, metric="euclidean")
-    label_cluster = clusterer.fit_predict(koordinat_2d)
+        koordinat_2d = _layout_lingkaran(n)
+        label_cluster = np.full(n, -1, dtype=int)
+        catatan = (
+            f"UMAP gagal memproyeksikan {n} task ini ({type(e).__name__}: {e}), "
+            "kemungkinan banyak task_desc yang embeddingnya nyaris identik. "
+            "Titik ditampilkan dengan layout sederhana, tanpa proyeksi/cluster."
+        )
+        return koordinat_2d, label_cluster, catatan
 
-    return koordinat_2d, label_cluster
+    min_cluster_size_efektif = max(2, min(int(min_cluster_size), n))
+    try:
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size_efektif, metric="euclidean")
+        label_cluster = clusterer.fit_predict(koordinat_2d)
+    except Exception as e:
+        label_cluster = np.full(n, -1, dtype=int)
+        catatan = f"HDBSCAN gagal mengelompokkan ({type(e).__name__}: {e}) -- semua task ditandai noise."
+        return koordinat_2d, label_cluster, catatan
+
+    catatan = None
+    if min_cluster_size_efektif != min_cluster_size:
+        catatan = (
+            f"min_cluster_size diturunkan otomatis dari {min_cluster_size} ke "
+            f"{min_cluster_size_efektif} karena cuma ada {n} task."
+        )
+
+    return koordinat_2d, label_cluster, catatan
 
 # ==========================================
 # 3. FIGURE SCATTER CLUSTER TASK (Plotly)
 # ==========================================
 def buat_figure_scatter(koordinat_2d, label_cluster, docs, metas) -> go.Figure:
+    if len(docs) == 0:
+        fig = go.Figure()
+        fig.update_layout(
+            title="Peta Cluster Task (task_desc) — Voyager Skill Library",
+            template="plotly_dark",
+            annotations=[dict(text="Tidak ada data", showarrow=False, font=dict(size=16))],
+        )
+        return fig
+
     warna = [warna_untuk_cluster(c) for c in label_cluster]
     hover_text = [
-        f"<b>Cluster {c}</b><br>{doc[:120]}<br><i>status: {m.get('status')}, skor: {m.get('skor')}</i>"
+        f"<b>Cluster {c}</b><br>{(doc or '')[:120]}<br><i>status: {m.get('status')}, skor: {m.get('skor')}</i>"
         for c, doc, m in zip(label_cluster, docs, metas)
     ]
 
@@ -158,10 +246,12 @@ def buat_figure_scatter(koordinat_2d, label_cluster, docs, metas) -> go.Figure:
 def parse_trace(trace_raw):
     try:
         data = json.loads(trace_raw) if isinstance(trace_raw, str) else trace_raw
-        return [item["name"] if isinstance(item, dict) else str(item) for item in data]
+        if not isinstance(data, list):
+            return []
+        return [item["name"] if isinstance(item, dict) and "name" in item else str(item) for item in data]
     except Exception:
         if isinstance(trace_raw, str) and "->" in trace_raw:
-            return [t.strip() for t in trace_raw.split("->")]
+            return [t.strip() for t in trace_raw.split("->") if t.strip()]
         return []
 
 def bangun_graph_tool(docs, metas, label_cluster):
@@ -174,6 +264,10 @@ def bangun_graph_tool(docs, metas, label_cluster):
       node_freq     : {tool: hitungan_total}
       node_status   : {tool: {"berhasil"|"gagal": hitungan}}
       node_contoh   : {tool: [ {...}, ... ]}
+
+    Tahan edge-case: trace yang cuma berisi START/END tanpa tool di antaranya,
+    trace kosong/gagal parse (di-skip diam-diam, nggak bikin crash), skor
+    non-numerik di metadata (dianggap 0 buat sorting).
     """
     edge_cluster = defaultdict(lambda: defaultdict(int))
     edge_status = defaultdict(lambda: defaultdict(int))
@@ -185,10 +279,14 @@ def bangun_graph_tool(docs, metas, label_cluster):
     for doc, meta, cid in zip(docs, metas, label_cluster):
         urutan_tool = parse_trace(meta.get("trace", "[]"))
         status = meta.get("status", "?")
+        try:
+            skor = int(meta.get("skor", 0))
+        except (ValueError, TypeError):
+            skor = 0
         contoh = {
             "task_desc": doc,
             "catatan_hasil": meta.get("catatan_hasil", ""),
-            "skor": meta.get("skor", 0),
+            "skor": skor,
             "status": status,
             "cluster": int(cid),
         }
@@ -268,6 +366,12 @@ _DETAIL_PANEL_TEMPLATE = """
 const NODE_DETAILS = __NODE_JSON__;
 const EDGE_DETAILS = __EDGE_JSON__;
 
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.innerText = (str === null || str === undefined) ? '' : String(str);
+  return div.innerHTML;
+}
+
 function tampilkanDetail(judul, data) {
   const panel = document.getElementById('detail-panel');
   const body = document.getElementById('detail-body');
@@ -279,10 +383,10 @@ function tampilkanDetail(judul, data) {
     data.contoh.forEach(function (c) {
       const warnaStatus = c.status === 'berhasil' ? '#2ecc71' : '#e74c3c';
       html += '<div style="border-top:1px solid #333; padding:8px 0;">'
-        + '<div style="font-weight:600; line-height:1.35;">' + c.task_desc + '</div>'
-        + '<div style="color:' + warnaStatus + '; margin-top:3px;">status: ' + c.status
-        + ' | skor: ' + c.skor + ' | cluster: ' + c.cluster + '</div>'
-        + '<div style="color:#aaa; font-style:italic; margin-top:3px;">' + (c.catatan_hasil || '') + '</div>'
+        + '<div style="font-weight:600; line-height:1.35;">' + escapeHtml(c.task_desc) + '</div>'
+        + '<div style="color:' + warnaStatus + '; margin-top:3px;">status: ' + escapeHtml(c.status)
+        + ' | skor: ' + escapeHtml(c.skor) + ' | cluster: ' + escapeHtml(c.cluster) + '</div>'
+        + '<div style="color:#aaa; font-style:italic; margin-top:3px;">' + escapeHtml(c.catatan_hasil || '') + '</div>'
         + '</div>';
     });
     body.innerHTML = html;
