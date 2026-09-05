@@ -34,7 +34,7 @@ _llms_groq = buat_llm(
 
 LLMs = DynamicTokenRouterLLM(
     llm_chain=[
-        {"llm": _llms_groq,   "nama": "Groq (cloud)",  "threshold": 8000},
+        {"llm": _llms_groq,   "nama": "Groq (cloud)",  "threshold": 8000, "min_threshold":1000},
         {"llm": _llms_ollama, "nama": "Ollama (lokal)", "threshold": None},
     ],
 )
