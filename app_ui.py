@@ -4,6 +4,7 @@ import uuid
 # --- IMPORT MODUL KUSTOM ---
 from views import(tab1_aichat, tab2_knowledge, tab3_automation, tab4_voyager)
 from database.job_db import init_job_db
+from database.sendmail_db import init_email_history_db
 from core_agent.config import sqlite_db_path, app_dir
 
 # --- KONFIGURASI HALAMAN ---
@@ -63,6 +64,7 @@ knowledge_dir = app_dir / "knowledge_docs"
 knowledge_dir.mkdir(parents=True, exist_ok=True)
 
 init_job_db()
+init_email_history_db()
 
 # 1. Manajemen Daftar Thread (Sesi)
 if "daftar_thread" not in st.session_state:

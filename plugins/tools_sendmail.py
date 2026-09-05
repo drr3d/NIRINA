@@ -1,7 +1,6 @@
 from core_agent.registry import ToolRegistry
 
 from .email_sendfunc import kirim_email_smtp
-#from .contact_osintfunc import pilih_kontak_terbaik
 from database.sendmail_db import simpan_riwayat_kirim, cari_riwayat_kirim, sudah_pernah_kirim
 from database.contact_db import cari_kontak
 
@@ -26,7 +25,7 @@ def kirim_lamaran_email(
     argumen -- yang diminta cuma NAMA environment variable tempat
     password itu disimpan di mesin yang jalanin agent (nama bebas, user
     yang nentuin sendiri pas nge-set env var-nya, mis.
-    "YOURMAIL_GMAIL_APPPASS"). Kalau env var itu belum diset/kosong,
+    "DPN2_GMAIL_APPPASS"). Kalau env var itu belum diset/kosong,
     pengiriman akan gagal dengan pesan yang jelas -- JANGAN pernah minta
     user ketik isi password-nya lewat chat, itu bukan tugas tool ini.
 
@@ -41,7 +40,7 @@ def kirim_lamaran_email(
         isi_email: isi/badan email (plain text).
         nama_env_var_password: NAMA environment variable tempat App
             Password akun pengirim disimpan (bukan password-nya
-            sendiri), mis. "YOURMAIL_GMAIL_APPPASS".
+            sendiri), mis. "DPN2_GMAIL_APPPASS".
         url_lowongan: url lowongan terkait (opsional, buat jejak riwayat
             -- supaya nanti bisa dicek "sudah pernah kirim buat lowongan
             ini belum" lewat `lihat_riwayat_lamaran`).
