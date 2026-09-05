@@ -1,6 +1,6 @@
 from langgraph.prebuilt import ToolNode
 
-from ..agent_nodes import AIBrainProcessor
+from ..agent_cerebral import AIBrainProcessor
 from .agent_factory import (
     LLMProviderRegistry, buat_llm, buat_skill_library, factory_tools_init
 )

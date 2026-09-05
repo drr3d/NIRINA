@@ -1,4 +1,4 @@
-import importlib
+import importlib, os
 import pkgutil
 import json
 from typing import Callable, Dict
@@ -96,18 +96,10 @@ class DynamicTokenRouterLLM:
         return int(len(text) / 3.5)
 
     def _hitung_token(self, messages) -> int:
-        """Estimasi total token SATU request -- isi pesan + skema tool yang
-        ke-bind (lihat _tool_schema_tokens). TIDAK termasuk max_tokens yang
-        direserve buat completion -- itu ditambahkan terpisah di invoke(),
-        karena reserved-nya beda-beda per entry LLM, bukan per pesan."""
         text_content = "\n".join(str(getattr(m, "content", "") or m) for m in messages) if isinstance(messages, list) else str(messages)
         return self._encode_len(text_content) + self._tool_schema_tokens
 
     def _hitung_tool_schema_tokens(self, tools) -> int:
-        """Serialize skema JSON semua tool yang di-bind (nama, deskripsi,
-        parameter) dan hitung token-nya SEKALI -- ini biasanya nyumbang RIBUAN
-        token yang sebelumnya sama sekali gak kehitung, karena skema tool
-        dikirim terpisah dari .content pesan (bukan bagian dari messages)."""
         try:
             from langchain_core.utils.function_calling import convert_to_openai_tool
             skema = [convert_to_openai_tool(t) for t in tools]
@@ -118,10 +110,6 @@ class DynamicTokenRouterLLM:
         return self._encode_len(schema_text)
 
     def bind_tools(self, tools, **kwargs):
-        """AIBrainProcessor cuma manggil .bind_tools() SEKALI di awal -- teruskan
-        binding itu ke SEMUA entry di chain sekaligus, kembalikan wrapper baru
-        yang SUDAH tau berapa token skema tool-nya (dihitung sekali di sini,
-        bukan diulang tiap invoke -- skema tool gak berubah antar giliran)."""
         new_chain = [
             {**entry, "llm": entry["llm"].bind_tools(tools, **kwargs)}
             for entry in self.llm_chain
@@ -132,12 +120,6 @@ class DynamicTokenRouterLLM:
         return new_instance
 
     def invoke(self, messages, **kwargs):
-        """Dicegat di sini setiap kali agen ingin berpikir -- coba tiap entry
-        di chain SESUAI URUTAN, skip yang thresholdnya kelewatan (lapis
-        pre-emptif, MEMPERHITUNGKAN max_tokens yang direserve entry itu buat
-        completion -- itu juga ikut dihitung provider ke TPM), dan kalau yang
-        lolos estimasi TETAP gagal pas beneran di-invoke, otomatis lanjut ke
-        entry berikutnya (lapis reaktif)."""
         estimasi_prompt = self._hitung_token(messages)
         error_terakhir = None
 
@@ -166,14 +148,10 @@ class DynamicTokenRouterLLM:
         ) from error_terakhir
 
 # ==========================================
+# ==========================================
 # [FRAMEWORK CORE] LLM PROVIDER REGISTRY
 # ==========================================
 class LLMProviderRegistry:
-    """
-    Registry untuk mendaftarkan dan memanggil berbagai provider LLM (Strategy Pattern).
-    User bisa menambah provider sendiri (misal: Anthropic, Gemini) dari luar 
-    tanpa perlu mengubah file framework ini sama sekali.
-    """
     _builders: Dict[str, Callable] = {}
 
     @classmethod
@@ -196,8 +174,6 @@ class LLMProviderRegistry:
         return builder
 
 # --- IMPLEMENTASI DEFAULT PROVIDERS ---
-# Setiap fungsi builder bertanggung jawab membersihkan kwargs agar LangChain tidak error
-# karena menerima parameter yang tidak dikenal.
 def _build_ollama(model_name: str, temperature: float, **kwargs):
     from langchain_ollama import ChatOllama
     # Hapus parameter standar yang tidak dipakai Ollama
@@ -235,8 +211,8 @@ def _build_groq(model_name: str, temperature: float, **kwargs):
     from langchain_groq import ChatGroq
     raw_api_key = kwargs.pop("api_key", "")
 
-    api_key = raw_api_key or "put_your_groq_api_key_here_as_default"
-    
+    api_key = raw_api_key or os.environ.get("GROQ_API_KEY")
+
     kwargs.pop("base_url", None) # Groq pakai endpoint paten
     kwargs.pop("num_ctx", None)
     kwargs.pop("reasoning", None)
@@ -251,10 +227,36 @@ def _build_groq(model_name: str, temperature: float, **kwargs):
         
     return ChatGroq(**groq_args, **kwargs)
 
-# Daftarkan ketiga provider bawaan framework ke dalam Registry
+def _build_cerebras(model_name: str, temperature: float, **kwargs):
+    from langchain_cerebras import ChatCerebras
+
+    raw_api_key = kwargs.pop("api_key", "")
+    api_key = raw_api_key or os.environ.get("CEREBRAS_API_KEY")  # kosong -> ChatCerebras fallback ke env CEREBRAS_API_KEY
+
+    kwargs.pop("base_url", None)  # Cerebras pakai endpoint paten (cloud.cerebras.ai)
+    kwargs.pop("num_ctx", None)   # bukan parameter yang dikenal Cerebras
+
+    reasoning_flag = kwargs.pop("reasoning", None)
+    reasoning_effort = kwargs.pop("reasoning_effort", None)
+    if reasoning_effort is None and reasoning_flag is not None:
+        reasoning_effort = "medium" if reasoning_flag else "low"
+
+    cerebras_args = {
+        "model": model_name,
+        "temperature": temperature,
+    }
+    if api_key:
+        cerebras_args["api_key"] = api_key
+    if reasoning_effort and "gpt-oss" in model_name.lower():
+        cerebras_args["reasoning_effort"] = reasoning_effort
+
+    return ChatCerebras(**cerebras_args, **kwargs)
+
+# Daftarkan keempat provider bawaan framework ke dalam Registry
 LLMProviderRegistry.register("ollama", _build_ollama)
 LLMProviderRegistry.register("openai", _build_openai)
 LLMProviderRegistry.register("groq", _build_groq)
+LLMProviderRegistry.register("cerebras", _build_cerebras)
 
 # ==========================================
 # [FRAMEWORK CORE] FACTORY LLM DINAMIS
@@ -386,24 +388,6 @@ def buat_skill_library(
 # [FRAMEWORK CORE] PLUGIN AUTO-DISCOVERY (DIPANGGIL EKSPLISIT, BUKAN OTOMATIS)
 # ==========================================
 def muat_plugins(folder=None, nama_package_import: str = "plugins"):
-    """
-    [FRAMEWORK CORE] Auto-discover & import semua modul Python di dalam SATU
-    folder plugin -- men-trigger decorator @ToolRegistry.register(...) (dan
-    @GuardrailRegistry.register(...), dst) di tiap file plugin, jadi tool-nya
-    otomatis kedaftar begitu function ini dipanggil.
-
-    CATATAN PENTING buat penulis plugin yang tool-nya butuh REFERENSI ke
-    skill_lib atau panggil_otak_llm milik SATU file aplikasi tertentu (mis.
-    lupakan_skill_gagal, atur_gorilla_tool_rag): JANGAN
-    `from core_agent.factory_security import panggil_otak_llm` di LEVEL MODUL
-    (bakal gagal -- lihat alasan #2 di atas). Import MODULE-nya saja
-    (`from core_agent import factory_security`), lalu akses
-    `factory_security.panggil_otak_llm` DI DALAM BODY FUNGSI tool (bukan di
-    level modul) -- Python baru resolve atribut itu saat tool BENERAN
-    dipanggil user, di titik mana factory_security.py sudah pasti selesai
-    dieksekusi penuh. Lihat plugin_atur_gorilla_tool_rag.py dan
-    plugin_lupakan_skill_gagal.py sebagai contoh pola yang benar.
-    """
     target_folder = folder or (app_dir / "plugins")
     if target_folder.exists():
         for _, module_name, _ in pkgutil.iter_modules([str(target_folder)]):
@@ -416,57 +400,14 @@ def factory_tools_init(
     *nama_tools_wajib: str,
     folder_plugins=None,
     nama_package_import: str = "plugins",
+    llm_mentah = None
 ):
-    """
-    [FRAMEWORK CORE] Gabungan 3 langkah yang WAJIB dipanggil berurutan di
-    SETIAP factory_*.py (security, multiagent, atau template baru apapun) --
-    urutannya di-hardcode DI SINI, bukan di file pemanggil, supaya penulis
-    factory baru tidak perlu hafal urutannya sendiri dan tidak bisa
-    salah-urut:
-
-        1. muat_plugins()                    -> trigger semua
-           @ToolRegistry.register(...)/@GuardrailRegistry.register(...) di
-           folder plugins/, jadi tool & guardrail-nya kedaftar.
-        2. ToolRegistry.sync_tools_to_db()    -> embed SEMUA tool (termasuk
-           dari plugin) ke ChromaDB, dipakai Gorilla Tool-RAG buat semantic
-           search. Kalau ini jalan SEBELUM langkah 1, tool dari plugin tidak
-           ikut ter-embed -- tidak error, cuma Gorilla jadi "buta" ke tool
-           itu terus sampai proses di-restart dengan urutan yang benar.
-        3. ToolRegistry.daftar_tool_wajib(*nama_tools_wajib) -> tool yang
-           HARUS selalu ter-bind ke main agent apapun hasil semantic
-           search-nya (biasanya tool "alur kerja", bukan tool "task", jadi
-           similarity ke deskripsi task user sering rendah).
-
-        Bahaya paling besar kalau urutan di atas dibongkar manual: kalau
-        ToolRegistry.get_all_tools()/get_tools(kategori) SUDAH kepanggil
-        SEBELUM muat_plugins() (mis. buat bind_tools()/ToolNode/
-        AIBrainProcessor) -- hasilnya berupa LIST PYTHON STATIS yang
-        di-capture SEKALI saat itu. Begitu di-capture, plugin yang baru
-        di-load SETELAHNYA tidak akan pernah muncul di list itu SEPANJANG
-        UMUR PROSES, walau tidak ada error apapun yang kelihatan. Bug jenis
-        ini yang paling nyebelin dicari manual, makanya urutannya dikunci
-        di satu fungsi ini.
-
-    SATU prasyarat yang TETAP jadi tanggung jawab PEMANGGIL (tidak bisa
-    dijamin dari sini, karena tergantung isi plugin masing-masing project):
-    panggil fungsi ini SETELAH semua instance project-specific (LLM,
-    skill_library, dst) yang mungkin dirujuk plugin lewat pola lazy-import
-    (lihat catatan lazy-import di muat_plugins()) sudah selesai dibuat.
-
-    Args:
-        *nama_tools_wajib: nama tool yang harus selalu ter-bind ke main
-            agent (diteruskan ke ToolRegistry.daftar_tool_wajib). Boleh
-            dikosongkan kalau agent ini memang tidak butuh tool wajib.
-        folder_plugins, nama_package_import: diteruskan apa adanya ke
-            muat_plugins() -- lihat docstring-nya kalau butuh folder plugin
-            custom (bukan folder default `app_dir / "plugins"`).
-    """
     print(
         "\n[⚙️ Bootstrap] Memuat plugin & menyinkronkan Tool-RAG -- pastikan "
         "LLM/skill_library project ini SUDAH dibuat sebelum baris ini "
         "dieksekusi (lihat docstring inisialisasi_plugin_dan_tools)."
     )
     muat_plugins(folder_plugins, nama_package_import)
-    ToolRegistry.sync_tools_to_db()
+    ToolRegistry.sync_tools_to_db(llm = llm_mentah)
     if nama_tools_wajib:
         ToolRegistry.daftar_tool_wajib(*nama_tools_wajib)
