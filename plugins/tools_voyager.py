@@ -1,5 +1,5 @@
 from core_agent.registry import ToolRegistry
-from core_agent.agent_factory.factory_skilllib import secskill_lib
+from core_agent.agent_factory.factory_skilllib import defaults_kill_lib
 
 @ToolRegistry.register(category="sensitive") 
 def tools_reward(catatan_hasil: str, skor: int = 60) -> str:
@@ -66,7 +66,7 @@ def lupakan_skill_gagal(nama_tool: str) -> str:
                    (mis. "tanyakan_ke_openrouter"). Harus sama persis dengan
                    nama tool yang terdaftar di ToolRegistry.
     """
-    jumlah = secskill_lib.hapus_skill_terkait_tool(nama_tool, hanya_status="gagal")
+    jumlah = defaults_kill_lib.hapus_skill_terkait_tool(nama_tool, hanya_status="gagal")
     if jumlah == 0:
         return (
             f"Tidak ditemukan catatan skill GAGAL yang menyebut tool '{nama_tool}'. "
