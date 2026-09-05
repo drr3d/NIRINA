@@ -2,10 +2,10 @@ from langgraph.prebuilt import ToolNode
 
 from ..agent_cerebral import AIBrainProcessor
 from ..agent_router import RouterConfig
-from ..sysprompt import system_prompt
+from ..systemprompt import system_prompt
 from ..registry import ToolRegistry
 
-from .factory_skilllib import secskill_lib
+from .factory_skilllib import defaults_kill_lib
 from .agent_factory import (
     buat_llm, factory_tools_init,
     top_k_tools_agent, maks_umur_skill_gagal_detik,
@@ -39,7 +39,7 @@ LLMs = DynamicTokenRouterLLM(
     ],
 )
 
-skill_lib = secskill_lib
+skill_lib = defaults_kill_lib
 
 factory_tools_init(
     "lihat_katalog_tools",
