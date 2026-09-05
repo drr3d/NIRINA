@@ -75,29 +75,7 @@ def _injeksi_ringkasan(cleaned_messages: list, ringkasan_baru: str) -> list:
     else:
         cleaned_messages.insert(0, pesan_ingatan)
     return cleaned_messages
-"""
-def optimasi_konteks_langchain(
-    messages,
-    current_summary="",
-    fast_llm=None,
-    batas_pesan_inturn: int = 15,
-    batas_karakter_inturn: int = 20_000,
-    panjang_min_kompresi: int = 300,
-):
-    cleaned_messages, pesan_untuk_diringkas = _bangun_cleaned_messages(
-        messages,
-        batas_pesan_inturn=batas_pesan_inturn,
-        batas_karakter_inturn=batas_karakter_inturn,
-        panjang_min_kompresi=panjang_min_kompresi,
-        ringkasan_aktif=bool(fast_llm),
-    )
-    ringkasan_baru = current_summary
-    if pesan_untuk_diringkas and fast_llm:
-        print("\n[🧠 Memory Manager] Mengompresi masa lalu menggunakan Fast LLM...")
-        ringkasan_baru = buat_ringkasan_memori(pesan_untuk_diringkas, fast_llm, current_summary)
-    cleaned_messages = _injeksi_ringkasan(cleaned_messages, ringkasan_baru)
-    return cleaned_messages, ringkasan_baru
-"""
+
 def _panjang_args_tool_calls(tool_calls) -> int:
     """Total panjang (karakter) semua argumen tool_calls, dalam bentuk JSON. Dipakai
     untuk cek ambang kompresi & buat katup ukuran dalam-giliran (lihat di bawah)."""
