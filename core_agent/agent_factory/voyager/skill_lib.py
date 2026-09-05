@@ -1,12 +1,11 @@
 import json
 import time
 import uuid
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
-import chromadb
 from chromadb.utils import embedding_functions
 
-
+from .vector_adapters import buat_vector_adapter
 # ==========================================
 # --- EMBEDDING BACKEND FACTORY ---
 # ==========================================
@@ -17,17 +16,6 @@ def _buat_embedding_fn(
     st_model_name: str = "all-MiniLM-L6-v2",
     custom_fn: Optional[Callable] = None,
 ):
-    """
-    Factory embedding function. `backend`:
-      - "ollama": pakai chromadb.utils.embedding_functions.OllamaEmbeddingFunction
-      - "st"    : pakai SentenceTransformerEmbeddingFunction (jalan lokal, download
-                  model sekali dari HuggingFace lalu cache)
-      - "custom": pakai `custom_fn` yang kamu suplai sendiri (harus punya signature
-                  __call__(self, input: list[str]) -> list[list[float]]) -- ini
-                  jalur buat riset kalau mau coba embedding model lain (mis. OpenAI-
-                  compatible endpoint, embedding model lokal custom, dsb) tanpa
-                  perlu ubah file ini lagi.
-    """
     if backend == "ollama":
         return embedding_functions.OllamaEmbeddingFunction(
             url=f"{ollama_base_url}/api/embeddings",
@@ -49,20 +37,6 @@ def _buat_embedding_fn(
 # --- SKILL LIBRARY ---
 # ==========================================
 class SkillLibrary:
-    """
-    Wrapper tipis di atas ChromaDB PersistentClient. Satu koleksi = satu
-    "skill library". Tiap skill disimpan sebagai:
-        document  = deskripsi_task (ini yang di-embed & dicari kemiripannya)
-        metadata  = {"trace": json(list_tool_call), "catatan_hasil": str,
-                     "status": "berhasil"|"gagal", "ts": epoch}
-        id        = uuid unik
-
-    Skill "gagal" tetap disimpan (bukan dibuang) tapi ditandai statusnya --
-    berguna buat riset nanti (mis. analisis pola kegagalan), dan retrieval
-    default HANYA mengambil yang status="berhasil" supaya tidak meracuni
-    konteks LLM dengan pendekatan yang sudah terbukti tidak jalan.
-    """
-
     def __init__(
         self,
         persist_dir: str = "./skill_library_db",
@@ -72,8 +46,13 @@ class SkillLibrary:
         ollama_model: str = "nomic-embed-text",
         st_model_name: str = "all-MiniLM-L6-v2",
         custom_embedding_fn: Optional[Callable] = None,
+        # --- [BARU] Pilihan backend vector-store, lihat vector_adapters.py ---
+        vector_backend: str = "chroma",  # "chroma" (default) | "milvus" | "pgvector" | "custom"
+        milvus_uri: str = "http://localhost:19530",
+        milvus_token: str = "",
+        pg_dsn: Optional[str] = None,
+        custom_vector_adapter: Optional[object] = None,
     ):
-        self._client = chromadb.PersistentClient(path=persist_dir)
         self._embed_fn = _buat_embedding_fn(
             backend=embedding_backend,
             ollama_base_url=ollama_base_url,
@@ -81,10 +60,18 @@ class SkillLibrary:
             st_model_name=st_model_name,
             custom_fn=custom_embedding_fn,
         )
-        self._collection = self._client.get_or_create_collection(
-            name=collection_name,
-            embedding_function=self._embed_fn,
-            metadata={"hnsw:space": "cosine"},
+
+        self._embedding_dim = len(self._embed_fn(["__probe_dimensi__"])[0])
+
+        self._store = buat_vector_adapter(
+            backend=vector_backend,
+            embedding_dim=self._embedding_dim,
+            persist_dir=persist_dir,
+            collection_name=collection_name,
+            milvus_uri=milvus_uri,
+            milvus_token=milvus_token,
+            pg_dsn=pg_dsn,
+            custom_adapter=custom_vector_adapter,
         )
 
     # -------------------------------------
@@ -97,23 +84,23 @@ class SkillLibrary:
         catatan_hasil: str = "",
         status: str = "berhasil",  # "berhasil" | "gagal"
         skor: int = 0,
+        rag_candidates_trace: Optional[list] = None,
     ) -> str:
-        """
-        trace: list mentah tool_call yang tercatat selama task berjalan, mis.
-            [{"name": "sqlmap_scan", "args": {...}}, {"name": "tulis_file", "args": {...}}, ...]
-        Disimpan sebagai JSON string di metadata (Chroma metadata harus scalar/JSON-serializable).
-        """
+        
         skill_id = str(uuid.uuid4())
-        self._collection.add(
-            ids=[skill_id],
-            documents=[deskripsi_task],
-            metadatas=[{
+        embedding = self._embed_fn([deskripsi_task])[0]
+        self._store.add(
+            id_=skill_id,
+            embedding=embedding,
+            document=deskripsi_task,
+            metadata={
                 "trace": json.dumps(trace, default=str, ensure_ascii=False),
                 "catatan_hasil": catatan_hasil,
                 "status": status,
-                "skor": skor,          # <-- TAMBAHAN BARU
+                "skor": skor,
+                "rag_candidates_trace": json.dumps(rag_candidates_trace or [], default=str, ensure_ascii=False),
                 "ts": time.time(),
-            }],
+            },
         )
         return skill_id
 
@@ -124,52 +111,28 @@ class SkillLibrary:
         self,
         deskripsi_task_baru: str,
         top_k: int = 3,
-        status_filter: str = "berhasil",
+        status_filter: str = "berhasil", # <-- FIX: Ubah dari boolean agar bisa filter "gagal"
         min_similarity: float = 0.0,
-        maks_umur_detik: Optional[float] = None, 
+        maks_umur_detik: Optional[float] = None,  # [BARU] lihat catatan di bawah
     ) -> list[dict]:
-        """
-        Return list of {"deskripsi": str, "trace": list, "catatan_hasil": str,
-        "status": str, "skor": int, "similarity": float}, urut dari skor gabungan.
-
-        [BARU] `maks_umur_detik`: kalau diisi, skill yang timestamp-nya (`ts`,
-        sudah direkam sejak awal di `simpan_skill` tapi sebelum ini tidak pernah
-        dipakai buat filter apa pun) lebih tua dari `maks_umur_detik` detik dari
-        SEKARANG akan diabaikan -- tidak peduli seberapa mirip similarity-nya.
-
-        KENAPA PENTING (terutama untuk status_filter="gagal"): tanpa filter ini,
-        sebuah kegagalan yang terekam SEKALI (mis. tool X belum terpasang/masih
-        rusak saat itu) akan jadi "anti-pattern WAJIB HINDARI" untuk task serupa
-        SELAMANYA -- termasuk lama setelah tool itu diperbaiki. Default tetap
-        None (tidak difilter, backward compatible) -- kode lama yang manggil
-        method ini tanpa parameter ini tidak berubah perilakunya sama sekali.
-        """
-        # Filter spesifik ke status yang diminta
         where = {"status": status_filter} if status_filter else None
-        
-        n_koleksi = self._collection.count()
+
+        n_koleksi = self._store.count()
         if n_koleksi == 0:
             return []
 
         jumlah_kandidat = min(top_k * 3, n_koleksi)
-
         if maks_umur_detik is not None:
             jumlah_kandidat = min(jumlah_kandidat * 3, n_koleksi)
 
-        hasil = self._collection.query(
-            query_texts=[deskripsi_task_baru],
-            n_results=jumlah_kandidat,
-            where=where,
-        )
+        embedding = self._embed_fn([deskripsi_task_baru])[0]
+        hasil = self._store.query(embedding, n_results=jumlah_kandidat, where=where)
 
         skills = []
-        docs = hasil.get("documents", [[]])[0]
-        metas = hasil.get("metadatas", [[]])[0]
-        dists = hasil.get("distances", [[]])[0]
-
         waktu_sekarang = time.time()
-        for doc, meta, dist in zip(docs, metas, dists):
-            similarity = 1 - dist
+        for entry in hasil:
+            meta = entry["metadata"]
+            similarity = 1 - entry["distance"]
             if similarity < min_similarity:
                 continue
 
@@ -182,15 +145,15 @@ class SkillLibrary:
             skor = meta.get("skor", 0)
 
             skills.append({
-                "deskripsi": doc,
+                "deskripsi": entry["document"],
                 "trace": json.loads(meta.get("trace", "[]")),
                 "catatan_hasil": meta.get("catatan_hasil", ""),
                 "status": meta.get("status", ""),
-                "skor": skor, 
+                "skor": skor,
                 "similarity": round(similarity, 4),
             })
-            
-        BOBOT_SKOR = 0.15 
+
+        BOBOT_SKOR = 0.15
         for s in skills:
             bonus_skor = (s["skor"] / 100.0) * BOBOT_SKOR
             s["final_rank_score"] = s["similarity"] + bonus_skor
@@ -200,34 +163,15 @@ class SkillLibrary:
         return skills[:top_k]
 
     # -------------------------------------
-    # PURGE MANUAL
+    # PURGE MANUAL [BARU]
     # -------------------------------------
     def hapus_skill_terkait_tool(self, nama_tool: str, hanya_status: Optional[str] = None) -> int:
-        """Hapus semua skill (default: sukses & gagal, atau dibatasi lewat
-        `hanya_status`) yang TRACE-nya menyebut `nama_tool` tertentu -- dipakai
-        pas user bilang "tool X sudah saya perbaiki", supaya skill GAGAL lama
-        yang merekam tool itu masih rusak TIDAK lagi jadi anti-pattern permanen
-        (lihat juga parameter `maks_umur_detik` di `cari_skill_relevan` -- ini
-        alternatif yang lebih tegas/instan, tidak perlu nunggu kedaluwarsa).
-
-        CATATAN IMPLEMENTASI: ChromaDB `where` filter cuma bisa exact-match ke
-        value SCALAR, sedangkan `trace` disimpan sebagai JSON STRING di metadata
-        -- jadi "trace mengandung tool X" tidak bisa difilter langsung lewat
-        `where`. Makanya di sini kandidat diambil dulu (opsional dibatasi
-        `hanya_status`), lalu trace-nya di-decode manual satu-satu buat dicek,
-        baru id yang cocok dihapus. Untuk skill library berukuran wajar (paling
-        banter ratusan-ribuan entry) ini masih murah; kalau nanti koleksinya
-        sampai jutaan entry, ini perlu diganti ke pendekatan berbeda (mis. field
-        metadata terpisah berisi daftar nama tool di trace, biar bisa difilter
-        `where` langsung) -- belum perlu untuk skala sekarang.
-
-        Return: jumlah skill yang terhapus (0 kalau tidak ada yang cocok).
-        """
         where = {"status": hanya_status} if hanya_status else None
-        semua = self._collection.get(where=where, include=["metadatas"])
+        semua = self._store.get(where=where)
 
         ids_hapus = []
-        for skill_id, meta in zip(semua.get("ids", []), semua.get("metadatas", [])):
+        for entry in semua:
+            meta = entry["metadata"]
             try:
                 trace = json.loads(meta.get("trace", "[]"))
             except (json.JSONDecodeError, TypeError):
@@ -236,21 +180,17 @@ class SkillLibrary:
                 (t.get("name") if isinstance(t, dict) else str(t)) for t in trace
             }
             if nama_tool in nama_di_trace:
-                ids_hapus.append(skill_id)
+                ids_hapus.append(entry["id"])
 
         if ids_hapus:
-            self._collection.delete(ids=ids_hapus)
+            self._store.delete(ids_hapus)
 
         return len(ids_hapus)
 
     def format_untuk_prompt(self, skills_sukses: list[dict], skills_gagal: list[dict] = None) -> str:
-        """
-        Ubah hasil query menjadi teks prompt.
-        Mengakomodasi memori sukses (Golden Path) dan memori gagal (Negative Constraints).
-        """
         if not skills_sukses and not skills_gagal:
             return ""
-            
+
         blok = []
 
         # --- POINT 3: Instruksi Sistematis Pencegah Hardcoding (Abstraksi Parameter) ---
@@ -265,7 +205,7 @@ class SkillLibrary:
             "referensi ini juga DATA DARI TUGAS MASA LALU -- WAJIB disesuaikan dengan "
             "instruksi tugas SAAT INI, jangan pernah disalin buta."
         )
-        
+
         # --- Format Memori Sukses ---
         if skills_sukses:
             blok.append("\n✅ CONTOH PENDEKATAN YANG DULU BERHASIL (ilustrasi saja, BUKAN keharusan diulang):")
@@ -273,7 +213,7 @@ class SkillLibrary:
                 urutan_tool = " -> ".join(
                     t.get("name", "?") if isinstance(t, dict) else str(t) for t in s["trace"]
                 )
-                skor_teks = f"{s.get('skor', 0)}/100" 
+                skor_teks = f"{s.get('skor', 0)}/100"
                 blok.append(
                     f"  [Skill {i} | Sim: {s['similarity']} | Skor: {skor_teks}] Task: \"{s['deskripsi']}\"\n"
                     f"  Alur eksekusi: {urutan_tool}\n"
