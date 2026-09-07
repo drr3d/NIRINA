@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from pathlib import Path
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -7,135 +8,138 @@ from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 
-# --- 1. SETUP PATH & DATABASE (Sinkron dengan knowledgeprocessor.py/textprocessor.py) ---
+# --- 1. SETUP PATH & DATABASE (Sinkron dengan textprocessor.py) ---
 app_dir = Path(__file__).resolve().parent
 db_path = (app_dir / "../APPDB/chroma_db").resolve()
 config_path = app_dir / "config.json"
-environment_rules_path = app_dir / "environment_rules.json"
 
-# Model embedding SAMA dengan knowledgeprocessor.py -- vektornya kompatibel,
-# db_path juga SAMA (satu Chroma persist directory dipakai bersama semua
-# domain), yang beda cuma collection_name di bawah.
-embeddings = OllamaEmbeddings(model="nomic-embed-text", base_url="http://127.0.0.1:11434")
+# download using ollama pull bge-m3, ollama pull paraphrase-multilingual
+# bge-m3 dan paraphrase-multilingual bagus untuk proses multilanguage data
+# nomic-embed-text <- small untuk 1 bahasa bagus
+embeddings = OllamaEmbeddings(model="paraphrase-multilingual", keep_alive=1800)
 
-# --- KUNCI UTAMA: collection_name terpisah dari 'hr_knowledge'/'cv', dst ---
+# --- KUNCI UTAMA: Menggunakan collection_name terpisah ---
 knowledge_db = Chroma(
     persist_directory=str(db_path),
     embedding_function=embeddings,
-    collection_name="coding_knowledge"
+    collection_name="document_knowledge"  # Dipisah agar tidak bercampur dengan collection lain (mis. CV)
 )
 
-# --- 2. NORMALISASI NAMA BAHASA ---
-# Chroma filter metadata itu EXACT MATCH -- kalau saat ingest ditulis "C++"
-# tapi saat generate ditulis "cpp", filter GAK BAKAL nemu apa-apa walau
-# datanya ada. Semua nama bahasa WAJIB lewat sini dulu biar konsisten.
-_ALIAS_BAHASA = {
-    "c++": "cpp", "cpp": "cpp", "c/c++": "cpp",
-    "py": "python", "python": "python", "python3": "python",
-    "js": "javascript", "javascript": "javascript",
-    "ts": "typescript", "typescript": "typescript",
-    "golang": "go", "go": "go",
-    "rs": "rust", "rust": "rust",
-    "java": "java",
-    "c": "c",
-}
 
-def normalisasi_bahasa(language: str) -> str:
-    kunci = (language or "").strip().lower()
-    return _ALIAS_BAHASA.get(kunci, kunci)
-
-
-# --- 3. PROMPT GENERATOR KODE (DIPISAH DUA JALUR, SAMA POLA DENGAN knowledgeprocessor.py) ---
-# Beda dari versi HR: {environment_rules} SELALU ada di kedua jalur (bukan
-# cuma di jalur RAG) -- aturan compiler/versi/cara-jalanin itu TIDAK BOLEH
-# bergantung pada apakah similarity search kebetulan nemu konteks atau tidak.
-
-# PROMPT A: Jalur RAG (kalau referensi buku ADA & relevan)
-prompt_dengan_buku = ChatPromptTemplate.from_messages([
+# --- 2. PROMPT GENERATOR JAWABAN (DIPISAH DUA JALUR) ---
+# PROMPT A: Jalur RAG (Jika dokumen relevan DITEMUKAN)
+prompt_dengan_konteks = ChatPromptTemplate.from_messages([
     ("system",
-     "Kamu adalah Senior Software Engineer yang menguasai banyak bahasa pemrograman. "
-     "Tugasmu menulis kode SESUAI permintaan user untuk bahasa {language}.\n\n"
-     "ATURAN PENALARAN (WAJIB DIIKUTI URUTANNYA):\n"
-     "1. ATURAN ENVIRONMENT di bawah ini MUTLAK dan TIDAK BOLEH DILANGGAR -- itu bukan saran "
-     "gaya penulisan, itu spesifikasi compiler/versi/cara-jalankan yang SEBENARNYA dipakai user. "
-     "Kode yang gak sesuai ATURAN ENVIRONMENT dianggap SALAH walau secara sintaks benar.\n"
-     "2. Ambil idiom/teknik/best-practice dari REFERENSI BUKU kalau relevan dengan permintaan.\n"
-     "3. JANGAN comot kode mentah dari referensi -- adaptasikan ke kebutuhan spesifik user, dan "
-     "tetap tunduk ke ATURAN ENVIRONMENT (referensi buku BUKAN sumber kebenaran soal environment).\n\n"
-     "ATURAN ENVIRONMENT untuk {language} (MUTLAK):\n{environment_rules}\n\n"
+     "Kamu adalah asisten yang menjawab pertanyaan HANYA berdasarkan potongan dokumen yang diberikan "
+     "di bawah ini (KONTEKS). Dokumen ini berasal dari file yang di-upload oleh user.\n\n"
+     "ATURAN PENALARAN (REASONING):\n"
+     "1. JAWAB BERDASARKAN KONTEKS: Gunakan informasi dari KONTEKS sebagai sumber utama jawabanmu. "
+     "Jangan mengarang informasi yang tidak ada di dalamnya.\n"
+     "2. BOLEH MENYIMPULKAN: Kamu boleh merangkum, menghubungkan antar-bagian, atau menjelaskan ulang "
+     "dengan bahasamu sendiri selama tetap didasarkan pada isi dokumen.\n"
+     "3. JUJUR JIKA TIDAK CUKUP: Jika konteks yang diberikan tidak cukup untuk menjawab pertanyaan "
+     "secara lengkap, katakan dengan jelas bagian mana yang tidak tercakup dalam dokumen.\n"
+     "4. SERTAKAN SUMBER: Jika relevan, sebutkan nama file dan halaman sumber informasi yang kamu pakai.\n"
+     "5. LINTAS BAHASA: KONTEKS bisa saja berbahasa Indonesia, Inggris, atau campuran keduanya, "
+     "sedangkan PERTANYAAN USER bisa dalam bahasa yang berbeda dari KONTEKS. Tetap gunakan KONTEKS "
+     "tersebut sebagai sumber jawaban meskipun bahasanya berbeda dari pertanyaan — jangan abaikan "
+     "konteks hanya karena beda bahasa.\n"
+     "6. BAHASA JAWABAN: Selalu jawab dalam bahasa yang sama dengan PERTANYAAN USER, terlepas dari "
+     "bahasa KONTEKS aslinya. Terjemahkan/rangkum isi konteks ke bahasa pertanyaan user.\n\n"
      "FORMAT OUTPUT:\n"
-     "- Kode lengkap dalam satu code block, siap dikompilasi/dijalankan APA ADANYA sesuai ATURAN ENVIRONMENT.\n"
-     "- Penjelasan singkat kalau ada bagian yang perlu diperhatikan user."
+     "- Jawaban langsung dan jelas terhadap pertanyaan user.\n"
+     "- (Opsional) Referensi singkat: [Sumber: nama_file - Hal. X]"
     ),
     ("human",
-     "REFERENSI BUKU (potongan relevan untuk {language}):\n{context}\n\n"
-     "PERMINTAAN USER:\n{user_request}"
+     "KONTEKS DARI DOKUMEN:\n{context}\n\n"
+     "PERTANYAAN USER:\n{user_request}"
     )
 ])
 
-# PROMPT B: Jalur Fallback (kalau belum ada referensi buku utk bahasa ini di DB)
-prompt_tanpa_buku = ChatPromptTemplate.from_messages([
+# PROMPT B: Jalur Fallback (Jika tidak ada dokumen relevan / database kosong)
+prompt_tanpa_konteks = ChatPromptTemplate.from_messages([
     ("system",
-     "Kamu adalah Senior Software Engineer yang menguasai banyak bahasa pemrograman. "
-     "Tugasmu menulis kode SESUAI permintaan user untuk bahasa {language}, menggunakan "
-     "pengetahuan terbaikmu dan standar industri.\n\n"
-     "ATURAN ENVIRONMENT untuk {language} (MUTLAK, TIDAK BOLEH DILANGGAR):\n{environment_rules}\n\n"
+     "Kamu adalah asisten yang membantu menjawab pertanyaan user.\n\n"
+     "ATURAN:\n"
+     "1. Tidak ditemukan potongan dokumen yang relevan di database untuk pertanyaan ini.\n"
+     "2. Jawab menggunakan pengetahuan umummu semaksimal mungkin, dengan jelas dan ringkas.\n"
+     "3. Beri tahu user secara eksplisit bahwa jawaban ini TIDAK berasal dari dokumen yang mereka "
+     "upload, melainkan dari pengetahuan umum, agar user tidak salah kira.\n"
+     "4. BAHASA JAWABAN: Selalu jawab dalam bahasa yang sama dengan PERTANYAAN USER.\n\n"
      "FORMAT OUTPUT:\n"
-     "- Kode lengkap dalam satu code block, siap dikompilasi/dijalankan APA ADANYA sesuai ATURAN ENVIRONMENT.\n"
-     "- Penjelasan singkat kalau ada bagian yang perlu diperhatikan user."
+     "- Jawaban langsung dan jelas terhadap pertanyaan user.\n"
+     "- Catatan singkat bahwa jawaban ini bukan berasal dari dokumen yang di-upload."
     ),
     ("human",
-     "PERMINTAAN USER:\n{user_request}"
+     "PERTANYAAN USER:\n{user_request}"
     )
+])
+# PROMPT C: Query Expansion (untuk retrieval lintas bahasa ID <-> EN)
+prompt_query_variant = ChatPromptTemplate.from_messages([
+    ("system",
+     "Kamu adalah alat bantu pencarian. Tugasmu HANYA menerjemahkan pertanyaan user ke satu bahasa lain "
+     "(kalau pertanyaannya berbahasa Indonesia, terjemahkan ke Inggris; kalau berbahasa Inggris, "
+     "terjemahkan ke Indonesia). Jangan menjawab pertanyaannya, jangan menambahkan penjelasan apa pun. "
+     "Balas HANYA dengan hasil terjemahannya saja, tanpa tanda kutip, tanpa embel-embel lain."
+    ),
+    ("human", "{user_request}")
 ])
 
 
-# --- 4. FUNGSI INGEST REFERENSI/BUKU PEMROGRAMAN (Multi-bahasa) ---
-def process_knowledge(file_path: str, language: str, start_page: int = 1) -> bool:
+# --- 3. FUNGSI UNTUK INGEST DOKUMEN (PDF apa pun, bebas topik) ---
+def list_document_sources() -> list:
     """
-    Membaca buku/referensi pemrograman (PDF) UNTUK SATU BAHASA TERTENTU,
-    memotongnya jadi chunks, dan menyimpannya ke collection 'coding_knowledge'
-    dengan metadata `language` -- supaya saat generate nanti, retrieval bisa
-    difilter per bahasa (potongan C++ tidak akan nyasar ke request Python, dst).
-
-    `language` WAJIB diisi (mis. "python", "cpp", "javascript") -- lihat
-    normalisasi_bahasa() untuk daftar alias yang dikenali.
+    Mengembalikan daftar nama file unik yang sudah pernah di-ingest ke collection
+    'document_knowledge'. Berguna untuk agent mengetahui dokumen apa saja yang tersedia,
+    atau untuk menyapa/disambiguasi user kalau ada beberapa dokumen ter-upload.
     """
-    language = normalisasi_bahasa(language)
-    if not language:
-        print("❌ [ERROR] Parameter `language` wajib diisi (mis. 'python', 'cpp').")
-        return False
+    try:
+        raw = knowledge_db.get(include=["metadatas"])
+        sources = {m.get("source") for m in raw.get("metadatas", []) if m.get("source")}
+        return sorted(sources)
+    except Exception as e:
+        print(f"-> [ERROR] Gagal mengambil daftar dokumen: {e}")
+        return []
 
+def process_document_knowledge(file_path: str, start_page: int = 1) -> bool:
+    """
+    Fungsi untuk membaca dokumen PDF yang di-upload user, memotongnya menjadi chunks,
+    dan menyimpannya ke dalam collection 'document_knowledge'.
+    Dilengkapi dengan fitur skip halaman (start_page) untuk efisiensi komputasi
+    (mis. melewati cover/daftar isi).
+    """
     filename = os.path.basename(file_path)
-    print(f"\n=== Memproses Referensi Coding [{language}]: {filename} ===")
+    print(f"\n=== Memproses Dokumen: {filename} ===")
 
     try:
+        # Load PDF dokumen
         loader = PyPDFLoader(file_path)
         documents = loader.load()
         print(f"-> [Load Sukses] Dokumen terdiri dari {len(documents)} halaman.")
 
-        # Skip halaman awal (cover, daftar isi, dll) -- sama seperti knowledgeprocessor.py
+        # Filter dokumen untuk skip halaman awal (cover, daftar isi, dll)
+        # Note: documents[i].metadata["page"] adalah 0-indexed dari PyPDFLoader
+        # Jadi doc.metadata.get("page", 0) + 1 adalah halaman aktual yang sesuai dengan mata manusia
         filtered_documents = [
             doc for doc in documents
             if doc.metadata.get("page", 0) + 1 >= start_page
         ]
 
+        # Validasi jika user memasukkan start_page yang melebihi jumlah halaman PDF
         if not filtered_documents:
             print(f"-> [Warning] Tidak ada halaman yang diproses karena start_page ({start_page}) melebihi total halaman PDF.")
             return False
 
         print(f"-> [Filter] Akan memproses {len(filtered_documents)} halaman (mulai dari halaman {start_page}).")
 
-        # Hapus data lama untuk file yang sama agar tidak ada duplikasi vector
+        # Hapus data lama untuk file yang sama agar tidak ada duplikasi vector (Vector Overwrite Protection)
         try:
             knowledge_db.delete(where={"source": filename})
             print(f"-> [Clean Up] Menghapus data vector lama untuk file: {filename}")
         except Exception:
             pass
 
-        # RecursiveCharacterTextSplitter tetap dipakai (bukan splitter khusus source-code)
-        # karena input di sini adalah BUKU/PDF (prosa + contoh kode bercampur), bukan file
-        # .py/.cpp mentah -- splitter berbasis paragraf lebih pas untuk konten begini.
+        # Split dokumen menjadi potongan kecil (chunk_size sedikit lebih besar agar dapet konteks utuh)
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1200,
             chunk_overlap=250,
@@ -143,138 +147,182 @@ def process_knowledge(file_path: str, language: str, start_page: int = 1) -> boo
         )
         chunks = text_splitter.split_documents(filtered_documents)
 
+        # Berikan metadata khusus pada setiap chunk
         ids = []
         for i, chunk in enumerate(chunks):
             chunk.metadata["source"] = filename
-            chunk.metadata["type"] = "coding_knowledge"
-            chunk.metadata["language"] = language  # <-- kunci filter saat retrieval
+            chunk.metadata["type"] = "document_knowledge"
+            # Pastikan format page untuk RAG transparan mulai dari index 1
             chunk.metadata["page"] = chunk.metadata.get("page", 0) + 1
 
-            unique_id = f"coding_{language}_{filename}_{i}"
+            # Pembuatan ID unik untuk kemudahan manajemen database (Delete/Update)
+            unique_id = f"knowledge_{filename}_{i}"
             ids.append(unique_id)
 
-        knowledge_db.add_documents(chunks, ids=ids)
-        print(f"-> [ChromaDB] Berhasil menyimpan {len(chunks)} chunk referensi [{language}] untuk {filename}!")
+        # --- SIMPAN KE CHROMADB SECARA BER-BATCH + RETRY (biar robust untuk dokumen besar) ---
+        # Dulu semua chunk dikirim dalam SATU panggilan add_documents() -- untuk dokumen
+        # ratusan halaman ini bisa jadi ribuan chunk berturut-turut tanpa jeda ke Ollama.
+        # Kalau di tengah jalan Ollama sempat bermasalah (unload/reload model, dsb),
+        # SELURUH proses gugur dan progres yang sudah berhasil pun ikut hilang karena baru
+        # "dianggap selesai" di akhir. Sekarang dipecah per-batch kecil, tiap batch di-retry
+        # sendiri-sendiri kalau gagal, dan progres per-batch langsung ke-commit ke Chroma
+        # (jadi kalaupun akhirnya berhenti di tengah, chunk yang sudah masuk TETAP tersimpan).
+        BATCH_SIZE = 40
+        MAX_RETRIES = 3
+        RETRY_DELAY_SECONDS = 8  # naik tiap percobaan (linear backoff sederhana)
+
+        total_chunks = len(chunks)
+        total_batches = (total_chunks + BATCH_SIZE - 1) // BATCH_SIZE
+        chunks_gagal = []  # simpan (chunk, id) yang gagal permanen buat dilaporkan di akhir
+
+        for batch_idx in range(total_batches):
+            start_i = batch_idx * BATCH_SIZE
+            end_i = min(start_i + BATCH_SIZE, total_chunks)
+            batch_chunks = chunks[start_i:end_i]
+            batch_ids = ids[start_i:end_i]
+
+            berhasil = False
+            for percobaan in range(1, MAX_RETRIES + 1):
+                try:
+                    knowledge_db.add_documents(batch_chunks, ids=batch_ids)
+                    berhasil = True
+                    break
+                except Exception as e:
+                    print(
+                        f"-> [Warning] Batch {batch_idx + 1}/{total_batches} gagal "
+                        f"(percobaan {percobaan}/{MAX_RETRIES}): {e}"
+                    )
+                    if percobaan < MAX_RETRIES:
+                        jeda = RETRY_DELAY_SECONDS * percobaan
+                        print(f"-> [Retry] Menunggu {jeda}s sebelum coba lagi...")
+                        time.sleep(jeda)
+
+            if berhasil:
+                print(
+                    f"-> [ChromaDB] Batch {batch_idx + 1}/{total_batches} tersimpan "
+                    f"({end_i}/{total_chunks} chunk)."
+                )
+            else:
+                print(
+                    f"-> [ERROR] Batch {batch_idx + 1}/{total_batches} GAGAL permanen "
+                    f"setelah {MAX_RETRIES}x percobaan. {len(batch_chunks)} chunk dilewati."
+                )
+                chunks_gagal.extend(batch_ids)
+
+            # Jeda kecil antar-batch supaya Ollama sempat "napas" (bantu cegah numpuknya
+            # resource/memory saat batch panjang berturut-turut).
+            time.sleep(1)
+
+        chunks_berhasil = total_chunks - len(chunks_gagal)
+        print(f"-> [ChromaDB] Selesai: {chunks_berhasil}/{total_chunks} chunk tersimpan untuk {filename}.")
+
+        if chunks_gagal:
+            print(
+                f"⚠️ [Partial] {len(chunks_gagal)} chunk gagal disimpan meski sudah di-retry "
+                f"{MAX_RETRIES}x. Jalankan ulang process_document_knowledge() untuk file yang "
+                f"sama kalau ingin coba lagi (chunk yang sudah berhasil tidak akan diulang "
+                f"karena delete-and-replace di awal fungsi akan menghapus semuanya dan memproses "
+                f"ulang dari nol)."
+            )
+
         print("=== Selesai ===\n")
-        return True
+        # Dianggap sukses kalau MINIMAL ada satu chunk yang berhasil tersimpan --
+        # panggil list_document_sources() atau cek log di atas untuk tau apakah ada yang
+        # gagal sebagian (partial success).
+        return chunks_berhasil > 0
 
     except Exception as e:
-        print(f"❌ [ERROR] Gagal memproses referensi coding: {e}")
+        print(f"❌ [ERROR] Gagal memproses dokumen: {e}")
         return False
 
 
-# --- 5. ATURAN ENVIRONMENT (WAJIB, TIDAK BERGANTUNG PADA RETRIEVAL) ---
-def _muat_environment_rules(language: str) -> str:
+# --- 4. FUNGSI RAG UNTUK MENJAWAB PERTANYAAN UMUM TENTANG DOKUMEN ---
+def generate_document_answer(user_request: str, source_filter: str = None) -> str:
     """
-    Baca aturan environment (compiler/versi/cara kompilasi/jalankan) untuk
-    SATU bahasa dari environment_rules.json. Ini SELALU disuntik ke prompt,
-    apapun hasil similarity search-nya -- constraint compiler/lingkungan user
-    tidak boleh cuma "kebetulan ke-retrieve atau tidak".
-    """
-    if not environment_rules_path.exists():
-        return "(Belum ada file environment_rules.json -- pakai standar umum bahasa ini.)"
-    try:
-        with open(environment_rules_path, "r", encoding="utf-8") as f:
-            semua_aturan = json.load(f)
-        aturan = semua_aturan.get(language)
-        if not aturan:
-            return f"(Belum ada aturan environment terdaftar untuk '{language}' -- pakai standar umum bahasa ini.)"
-        return json.dumps(aturan, ensure_ascii=False, indent=2)
-    except Exception as e:
-        return f"(Gagal membaca environment_rules.json: {e} -- pakai standar umum bahasa ini.)"
+    Fungsi RAG yang dipanggil saat user bertanya tentang isi dokumen yang di-upload.
+    Mengambil konteks dari database knowledge, lalu melemparnya ke LLM lokal.
+    Dilengkapi dengan fallback Zero-Shot jika database kosong / tidak ada yang relevan.
 
-# PROMPT C: Ekstraksi query -- ubah narasi bebas user jadi istilah teknis yang
-# selaras gaya buku referensi. Dipakai KHUSUS buat similarity_search, bukan
-# buat generate kode -- generate kode tetap pakai user_request asli (lihat
-# generate_code_solution).
-prompt_ekstrak_query = ChatPromptTemplate.from_messages([
-    ("system",
-     "Kamu membantu proses pencarian di database referensi buku pemrograman {language}. "
-     "Dari PERMINTAAN USER di bawah, ekstrak istilah/konsep TEKNIS {language} yang relevan "
-     "untuk dicari (fitur bahasa, library, pola desain, teknik implementasi) -- BUKAN narasi "
-     "kebutuhan bisnis/task-nya. Contoh: permintaan 'kirim email tiap jam 8 pagi' -> konsep "
-     "teknisnya 'scheduling/timer, thread sleep, SMTP client, formatting tanggal-waktu'.\n\n"
-     "Jawab HANYA dengan daftar istilah teknis dipisah koma, tanpa penjelasan, tanpa kalimat "
-     "pembuka/penutup."
-    ),
-    ("human", "PERMINTAAN USER:\n{user_request}")
-])
-
-# --- 6. FUNGSI RAG UNTUK MENGHASILKAN KODE ---
-def generate_code_solution(user_request: str, language: str) -> str:
+    source_filter (opsional): nama file spesifik (harus persis sama seperti hasil
+    list_document_sources()). Kalau diisi, pencarian dibatasi HANYA ke dokumen itu.
+    Kalau None (default), pencarian dilakukan lintas SEMUA dokumen yang ter-upload.
     """
-    Fungsi RAG yang dipanggil saat user minta dibuatkan/diperbaiki kode.
-    Retrieval DIFILTER per `language` (jadi referensi C++ dan Python, dkk,
-    tidak akan saling bercampur), dan aturan environment SELALU disuntik ke
-    prompt terlepas dari hasil retrieval. Dilengkapi fallback Zero-Shot kalau
-    belum ada referensi buku utk bahasa tersebut di database.
-    """
-    language = normalisasi_bahasa(language)
-    if not language:
-        return "Gagal: parameter `language` wajib diisi (mis. 'python', 'cpp')."
-
-    # 1. Baca konfigurasi model aktif (key beda dari HR: 'model_coder')
+    # 1. Baca konfigurasi model aktif
     model_name = "qwen3.5:4b"
     if config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 config_data = json.load(f)
-                model_name = config_data.get("model_coder", "qwen3.5:4b")
+                model_name = config_data.get("model_extractor", "qwen3.5:4b")
         except Exception:
             pass
 
-    # 2a. Ubah permintaan user (narasi bebas) jadi query pencarian yang selaras gaya
-    # buku referensi (istilah teknis, bukan cerita kebutuhan) -- narasi task dan isi
-    # buku referensi punya "gaya bahasa" beda, jadi similarity search ke query mentah
-    # sering meleset walau datanya sebenarnya ada.
-    query_pencarian = user_request
+    print(f"-> [RAG] Mencari konteks relevan untuk pertanyaan: '{user_request}'..."
+          + (f" (dibatasi ke file: {source_filter})" if source_filter else ""))
+
+    # 2. Siapkan LLM lokal lebih dulu (dipakai untuk query-expansion & generasi jawaban)
+    llm = ChatOllama(model=model_name, temperature=0.2)
+
+    search_kwargs = {"filter": {"source": source_filter}} if source_filter else {}
+
+    # 2a. Cari chunk relevan pakai query asli
+    docs = knowledge_db.similarity_search(user_request, k=4, **search_kwargs)
+
+    # 2b. QUERY EXPANSION: buat 1 variasi query dalam bahasa "lawan" (ID<->EN).
+    # Ini penting karena embedding model (meski sudah multilingual) tetap bisa lebih akurat
+    # kalau query dan dokumen berada di bahasa yang sama. Dengan menambah pencarian pakai
+    # query hasil terjemahan, dokumen berbahasa lain jadi lebih mudah ketemu.
     try:
-        query_llm = ChatOllama(model=model_name, temperature=0.3)
-        hasil_ekstrak = (prompt_ekstrak_query | query_llm).invoke({
-            "user_request": user_request,
-            "language": language,
-        })
-        if hasil_ekstrak.content and hasil_ekstrak.content.strip():
-            query_pencarian = hasil_ekstrak.content.strip()
+        variant_query = (prompt_query_variant | llm).invoke({
+            "user_request": user_request
+        }).content.strip()
+
+        if variant_query and variant_query.lower() != user_request.strip().lower():
+            print(f"-> [RAG] Query variant (lintas bahasa): '{variant_query}'")
+            docs_variant = knowledge_db.similarity_search(variant_query, k=4, **search_kwargs)
+
+            # Gabungkan hasil pencarian original + variant, dedupe berdasarkan (source, page, isi)
+            seen = {(d.metadata.get("source"), d.metadata.get("page"), d.page_content) for d in docs}
+            for d in docs_variant:
+                key = (d.metadata.get("source"), d.metadata.get("page"), d.page_content)
+                if key not in seen:
+                    docs.append(d)
+                    seen.add(key)
     except Exception as e:
-        print(f"-> [RAG] Gagal ekstraksi query ({e}), fallback pakai request asli.")
+        # Kalau query expansion gagal (mis. LLM error), lanjut saja pakai hasil query original
+        print(f"-> [RAG] Query expansion dilewati karena error: {e}")
 
-    print(f"-> [RAG] Mencari referensi [{language}] pakai query: '{query_pencarian}' (asli: '{user_request}')...")
+    # Batasi jumlah chunk konteks yang dikirim ke LLM biar tidak kebanyakan
+    docs = docs[:6]
 
-    # 2b. Cari chunk relevan, DIFILTER metadata language
-    docs = knowledge_db.similarity_search(query_pencarian, k=4, filter={"language": language})
-
-    # 3. Aturan environment SELALU dimuat, independen dari hasil retrieval di atas.
-    environment_rules = _muat_environment_rules(language)
-
+    # 3. Panggil LLM lokal (dengan temperature rendah agar patuh pada isi dokumen)
     try:
-        llm = ChatOllama(model=model_name, temperature=0.2)
-        print(f"-> [AI Generator] Menyusun kode [{language}] menggunakan model: {model_name}...")
+        print(f"-> [AI Generator] Menyusun jawaban menggunakan model: {model_name}...")
 
+        # Fallback ke pengetahuan bawaan AI jika DB kosong atau tidak relevan
         if not docs:
-            print(f"-> [RAG] Belum ada referensi [{language}] di database. Beralih ke pengetahuan bawaan (Zero-Shot)...")
-            response = (prompt_tanpa_buku | llm).invoke({
-                "user_request": user_request,
-                "language": language,
-                "environment_rules": environment_rules,
+            print("-> [RAG] Tidak ada dokumen relevan ditemukan. Beralih ke pengetahuan bawaan (Zero-Shot)...")
+            response = (prompt_tanpa_konteks | llm).invoke({
+                "user_request": user_request
             })
         else:
-            print(f"-> [RAG] Menemukan referensi [{language}] relevan. Memakai prompt dengan buku acuan.")
+            print("-> [RAG] Menemukan konteks relevan. Memakai prompt dengan dokumen acuan.")
+            # Gabungkan dokumen yang relevan beserta informasi halaman untuk transparansi
             context_list = []
             for doc in docs:
                 source_file = doc.metadata.get("source", "Unknown")
                 page_num = doc.metadata.get("page", "?")
                 context_list.append(f"[Sumber: {source_file} - Hal. {page_num}]\n{doc.page_content}")
+
             context = "\n\n---\n\n".join(context_list)
 
-            response = (prompt_dengan_buku | llm).invoke({
+            response = (prompt_dengan_konteks | llm).invoke({
                 "context": context,
-                "user_request": user_request,
-                "language": language,
-                "environment_rules": environment_rules,
+                "user_request": user_request
             })
 
         return response.content
 
     except Exception as e:
-        return f"Gagal menghasilkan kode karena error: {e}"
+        # Menangkap dan mengembalikan pesan error dengan anggun (graceful degradation)
+        return f"Gagal menghasilkan jawaban karena error: {e}"

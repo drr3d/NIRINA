@@ -4,10 +4,9 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 
-# [UPDATE]: Import fungsi yang sudah disesuaikan penamaannya menjadi generik
 try:
     # Pastikan Anda juga mengubah nama fungsi di knowledgeprocessor.py menjadi process_knowledge
-    from database.knowledgeprocessor import process_knowledge, knowledge_db
+    from database.knowledgeprocessor import process_document_knowledge, knowledge_db
     KNOWLEDGE_PROCESSOR_AVAILABLE = True
 except ImportError:
     KNOWLEDGE_PROCESSOR_AVAILABLE = False
@@ -55,8 +54,7 @@ def render(sqlite_db_path, knowledge_dir):
                     if KNOWLEDGE_PROCESSOR_AVAILABLE:
                         with st.spinner(f"Memproses {file_name} mulai dari hal. {start_page}..."):
                             # Memanggil fungsi prosesor generik
-                            is_success = process_knowledge(str(save_path),
-                                                           language="cpp",
+                            is_success = process_document_knowledge(str(save_path),
                                                            start_page=start_page)
                             
                             if is_success:
@@ -64,10 +62,9 @@ def render(sqlite_db_path, knowledge_dir):
                                     with sqlite3.connect(sqlite_db_path, timeout=30.0) as conn:
                                         cursor = conn.cursor()
                                         cursor.execute("PRAGMA journal_mode=WAL;")
-                                        
-                                        # [UPDATE]: Nama tabel diubah menjadi knowledge_docs, kolom uploaded_by dihapus
+
                                         cursor.execute('''
-                                            INSERT OR REPLACE INTO knowledge_docs (filename, upload_date)
+                                            INSERT OR REPLACE INTO hr_knowledge (filename, upload_date)
                                             VALUES (?, ?)
                                         ''', (file_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                                         conn.commit()
@@ -90,12 +87,11 @@ def render(sqlite_db_path, knowledge_dir):
     try:
         with sqlite3.connect(sqlite_db_path, timeout=30.0) as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
-            # [UPDATE]: Mengambil dari tabel knowledge_docs yang baru
-            df_knowledge = pd.read_sql_query("SELECT * FROM knowledge_docs", conn)
+            df_knowledge = pd.read_sql_query("SELECT * FROM hr_knowledge", conn)
     except Exception as e:
         df_knowledge = pd.DataFrame()
         # Mencegah error jika tabel belum dibuat di SQLite
-        st.warning("Tabel database 'knowledge_docs' belum ada atau masih kosong.")
+        st.warning("Tabel database 'hr_knowledge' belum ada atau masih kosong.")
         
     if df_knowledge.empty:
         st.info("Belum ada dokumen yang diunggah.")
@@ -130,7 +126,7 @@ def render(sqlite_db_path, knowledge_dir):
                     cursor = conn.cursor()
                     cursor.execute("PRAGMA journal_mode=WAL;")
                     # [UPDATE]: Query delete disesuaikan dengan tabel baru
-                    cursor.execute("DELETE FROM knowledge_docs WHERE filename = ?", (file_to_delete,))
+                    cursor.execute("DELETE FROM hr_knowledge WHERE filename = ?", (file_to_delete,))
                     conn.commit()
                     
                 st.success(f"✅ File {file_to_delete} berhasil dihapus dari semua database.")
