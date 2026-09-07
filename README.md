@@ -5,13 +5,13 @@
 # N.I.R.I.N.A.
 
 > **NaN Intelligent Random Initiator Neuro-Artificial**  
-> A lightweight Agentic AI Framework designed to maximize the capabilities of local LLMs through structured reasoning, tool orchestration, and stateful execution.
+> A modular Agentic AI Framework designed to maximize the capabilities of local LLMs through structured reasoning, tool orchestration, and stateful execution.
 
 ---
 
 ## 🧠 What is N.I.R.I.N.A.?
 
-**N.I.R.I.N.A.** is a modular **Agentic AI Framework** designed to turn local language models, particularly the small ones(4-17b) (SLMs) into capable, tool-using autonomous agents.
+**N.I.R.I.N.A.** is a modular **Agentic AI Framework** designed to turn local language models into capable, tool-using autonomous agents, from small-parameter models to larger models.
 
 Instead of relying entirely on large cloud-based models, N.I.R.I.N.A. focuses on improving the **system around the model**:
 
@@ -24,7 +24,7 @@ Instead of relying entirely on large cloud-based models, N.I.R.I.N.A. focuses on
 
 The core philosophy is simple:
 
-> **Don't make the model bigger. Make the system around the model smarter.**
+> **Make the system around the model smarter.**
 
 N.I.R.I.N.A. is built on top of **LangGraph** and **LangChain**, providing a graph-driven execution layer where the LLM acts as the reasoning core while external capabilities are provided through modular tools.
 
@@ -84,7 +84,7 @@ N.I.R.I.N.A. is designed around the following execution principle:
 
 **Observe → Reason → Decide → Act → Observe Result → Reflect → Repeat**
 
-Instead of allowing an SLM to generate a complete solution purely through text generation, N.I.R.I.N.A. gives the model access to **real execution feedback**.
+Instead of relying purely on text generation, N.I.R.I.N.A. gives the model access to **real execution feedback**.
 
 A typical execution flow is:
 
@@ -116,11 +116,11 @@ N.I.R.I.N.A. does **not** claim to eliminate hallucinations.
 
 Instead, it aims to **reduce the probability and impact of hallucinated actions** by constraining what the agent can actually execute.
 
-The architecture takes conceptual inspiration from research such as **Gorilla LLM** and **Voyager**.
+The architecture takes conceptual inspiration from **Gorilla LLM**, **Voyager**, **HyDE**, and context retrieval approaches such as those described by **Anthropic**.
 
 ### 🦍 Gorilla — API & Tool Grounding
 
-The The **[Gorilla LLM](https://github.com/ShishirPatil/gorilla)** project demonstrates the importance of grounding LLM-generated actions against available APIs and tools. approach demonstrates the importance of grounding LLM-generated actions against available APIs and tools.
+The **[Gorilla LLM](https://github.com/ShishirPatil/gorilla)** project demonstrates the importance of grounding LLM-generated actions against available APIs and tools.
 
 N.I.R.I.N.A. adopts a similar principle:
 
@@ -138,13 +138,16 @@ This reduces the search space for tool calling and makes invalid actions easier 
 ### 🧱 Voyager — Execution & Feedback
 
 The **[Voyager](https://github.com/MineDojo/Voyager)** project demonstrates the value of an iterative interaction loop where an agent learns from actual execution rather than relying purely on textual reasoning.
- demonstrates the value of an iterative interaction loop where an agent learns from actual execution rather than relying purely on textual reasoning.
 
 N.I.R.I.N.A. applies a similar philosophy:
 
 **Plan → Execute → Observe → Evaluate → Correct → Execute Again**
 
 A failed tool call can therefore become **feedback** that helps guide the next action.
+
+### 🔎 HyDE & Context Retrieval
+
+N.I.R.I.N.A. also uses **HyDE (Hypothetical Document Embeddings)** and context retrieval techniques inspired by approaches discussed by **Anthropic** to improve retrieval quality and provide the reasoning process with more relevant context.
 
 ---
 
@@ -200,7 +203,38 @@ The same Brain can be equipped with completely different Sensors depending on th
 ### 🛠️ Embedded Functionality
 - Web chat interface
 - RAG Agent knowledge extension
+- Voyager Skill Visualization
+- Mini Notes stored in ChromaDB for reusable user knowledge
 - Simple Automation
+
+### 🚀 Runners
+
+N.I.R.I.N.A. can run multiple interfaces from a single entry point:
+
+- Streamlit
+- Telegram
+- API Service
+
+Runners can be selected as needed and can also run simultaneously.
+
+### 🗄️ Vector Database
+
+The framework uses **ChromaDB** as the default vector database, with adapters for:
+
+- Milvus
+- pgvector
+---
+
+## ▶️ Running N.I.R.I.N.A.
+
+The main entry point is:
+
+```bash
+python app.py
+```
+
+The runner can be configured to use **Streamlit, Telegram, or API Service**, and multiple runners can run simultaneously.
+
 ---
 
 ## 🚀 Implementations
@@ -264,7 +298,7 @@ The execution layer connects reasoning with real-world actions through structure
 
 ### Model Layer
 
-N.I.R.I.N.A. is designed to work with locally hosted small-parameter models through runtimes such as:
+N.I.R.I.N.A. is designed to work with locally hosted models through runtimes such as:
 
 - Ollama
 - llama.cpp
@@ -280,10 +314,12 @@ This separation allows the same Brain architecture to operate across different d
 | Agent Framework | LangGraph |
 | Tool Integration | LangChain |
 | LLM Runtime | Ollama / llama.cpp |
-| Local Models | Qwen, Llama, and other SLMs |
+| Local Models | Qwen, Llama, and other local LLMs |
+| Vector Database | ChromaDB (default), Milvus, pgvector |
 | Language | Python 3.11+ |
+| Runners | Streamlit, Telegram, API Service |
 | UI | Streamlit |
-| Architecture Inspiration | Gorilla LLM, Voyager |
+| Architecture Inspiration | Gorilla LLM, Voyager, HyDE, Anthropic |
 
 ---
 
@@ -291,7 +327,7 @@ This separation allows the same Brain architecture to operate across different d
 
 N.I.R.I.N.A. is built around several core goals:
 
-1. **Make small local models more useful.**
+1. **Make local models more useful through system-level architecture.**
 2. **Reduce unnecessary dependence on large cloud models.**
 3. **Make tool execution explicit and controllable.**
 4. **Use execution feedback to improve reliability.**
@@ -308,7 +344,7 @@ N.I.R.I.N.A. is built around several core goals:
 
 N.I.R.I.N.A. treats the LLM as the **reasoning core**, while Sensors/Tool provide the capabilities required to interact with the real world.
 
-**Small Model. Structured Brain. Modular Sensors/Tool. Real Execution.**
+**Local Model. Structured Brain. Modular Sensors/Tools. Real Execution.**
 
 ---
 

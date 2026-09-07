@@ -69,7 +69,6 @@ def rasio_sukses(status_count: dict) -> float:
 # 1. AMBIL DATA DARI CHROMADB
 # ==========================================
 def ambil_data_skill(db_path: str, collection_name: str, embedding_fn=None):
-
     client = chromadb.PersistentClient(path=db_path)
     col = client.get_or_create_collection(name=collection_name)
     hasil = col.get(include=["documents", "metadatas"])
@@ -178,7 +177,6 @@ def cluster_task_desc(embeddings: np.ndarray, min_cluster_size: int = 3):
         if not np.isfinite(koordinat_2d).all():
             raise ValueError("UMAP menghasilkan koordinat non-finite (NaN/Inf).")
     except Exception as e:
-
         koordinat_2d = _layout_lingkaran(n)
         label_cluster = np.full(n, -1, dtype=int)
         catatan = (

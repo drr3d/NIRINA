@@ -68,11 +68,12 @@ class DynamicTokenRouterLLM:
     -- pas buat entry PALING TERAKHIR di chain (mis. model lokal yang gak
     ada limit TPM keras), supaya selalu ada tempat jatuh paling akhir.
     """
-    def __init__(self, llm_chain: list, default_threshold: int = 6500, encoding_name: str = "cl100k_base"):
+    def __init__(self, llm_chain: list, default_threshold: int = 6500, default_minthreshold: int = 0, encoding_name: str = "cl100k_base"):
         if not llm_chain:
             raise ValueError("llm_chain tidak boleh kosong -- minimal 1 entry.")
         self.llm_chain = llm_chain
         self.default_threshold = default_threshold
+        self.default_minthreshold = default_minthreshold
         self.encoding_name = encoding_name
         # Token skema tool (nama+deskripsi+parameter dari SEMUA tool yang
         # di-bind_tools()) -- ini komponen BESAR yang kelewat kalau cuma ngitung
@@ -126,12 +127,21 @@ class DynamicTokenRouterLLM:
         for i, entry in enumerate(self.llm_chain):
             nama = entry.get("nama", f"llm_{i}")
             threshold = entry.get("threshold", self.default_threshold)
+            # butuh ini min_threshold, biar bisa menghemat pemanggilan groq, 
+            #  karena token kecil lebih baik dilempar ke ollama local.
+            #  kecuali punya akun berbayar dengan token unlimit, maka abaikan aja min_threshold
+            min_threshold = entry.get("min_threshold", self.default_minthreshold)
    
             reserved = getattr(entry["llm"], "max_tokens", None) or 0
             estimasi_efektif = estimasi_prompt + reserved
 
             if threshold is not None and estimasi_efektif > threshold:
                 print(f"[🔀 ROUTER] Skip '{nama}' (prompt {estimasi_prompt} + reserved {reserved} = {estimasi_efektif} > threshold {threshold})")
+                continue
+
+            print(estimasi_efektif, min_threshold, type(estimasi_efektif), type(min_threshold))
+            if min_threshold is not None and estimasi_efektif < int(min_threshold):
+                print(f"[🔀 ROUTER] Skip '{nama}' To Save (prompt {estimasi_prompt} + reserved {reserved} = {estimasi_efektif} < threshold {threshold})")
                 continue
 
             try:

@@ -9,12 +9,6 @@ from typing import Optional
 # --- KONTRAK ADAPTER ---
 # ==========================================
 class VectorStoreAdapter(ABC):
-    """Kontrak minimal yang WAJIB dipenuhi backend vector-store apapun
-    supaya bisa dipasang di belakang SkillLibrary tanpa mengubah
-    skill_lib.py atau apa pun di atasnya (SkillLibraryOrchestrator,
-    AIBrainProcessor). Implementasi backend baru di luar 3 yang disediakan
-    di sini (Chroma/Milvus/pgvector) cukup subclass ini."""
-
     @abstractmethod
     def add(self, id_: str, embedding: list, document: str, metadata: dict) -> None:
         """Simpan SATU entry baru (upsert -- kalau `id_` sudah ada, timpa)."""
@@ -47,8 +41,12 @@ class VectorStoreAdapter(ABC):
         ...
 
     @abstractmethod
-    def count(self) -> int:
-        """Jumlah total entry di koleksi/collection/table ini."""
+    def count(self, where: Optional[dict] = None) -> int:
+        """Jumlah entry di koleksi/collection/table ini, opsional difilter
+        exact-match `where` (SATU key, sama seperti `query()`/`get()`).
+        `where=None` (default) = jumlah TOTAL, perilaku identik dgn versi
+        sebelum parameter ini ada -- 100% backward-compatible utk caller
+        lama yg manggil `count()` tanpa argumen."""
         ...
 
 
@@ -66,29 +64,6 @@ def _filter_tunggal(where: Optional[dict]):
 # --- BACKEND: CHROMADB (DEFAULT) ---
 # ==========================================
 class ChromaAdapter(VectorStoreAdapter):
-    """
-    Adapter default (dan BACKWARD-COMPATIBLE) -- membungkus persis
-    ChromaDB PersistentClient yang sebelumnya dipakai LANGSUNG oleh
-    SkillLibrary. Kalau Anda tidak butuh scale-up sama sekali, tidak ada
-    yang berubah dari sisi data/behavior -- ini murni "pindah rumah" kode
-    yang sama persis ke belakang interface adapter.
-
-    [CATATAN MIGRASI] Versi SkillLibrary lama menempelkan `embedding_function`
-    langsung ke collection Chroma (dipakai buat auto-embed saat `.add()`/
-    `.query()` dipanggil dgn `documents=`/`query_texts=`). Adapter ini
-    SENGAJA membuat collection TANPA embedding_function (`embedding_function=
-    None`) karena sekarang skill_lib.py SELALU mengoper `embeddings=`/
-    `query_embeddings=` eksplisit -- Chroma tidak pernah diminta meng-embed
-    sendiri lagi. Untuk koleksi BARU ini tidak masalah sama sekali. Untuk
-    koleksi LAMA yang sudah pernah dibuat versi sebelumnya (dengan
-    embedding_function tertentu terpasang), sebagian versi ChromaDB bisa
-    komplain "embedding function mismatch" saat collection lama dibuka lagi
-    dengan konfigurasi berbeda -- kalau itu terjadi, migrasi paling aman
-    adalah `get_or_create_collection` dengan `collection_name` BARU (data
-    lama tetap aman di koleksi lama, bisa di-reindex manual kalau perlu)
-    daripada memaksa buka collection lama dengan konfigurasi baru.
-    """
-
     def __init__(self, persist_dir: str, collection_name: str):
         import chromadb  # lazy import -- opsional kalau backend lain yang dipakai
 
@@ -132,40 +107,17 @@ class ChromaAdapter(VectorStoreAdapter):
         if ids:
             self._collection.delete(ids=list(ids))
 
-    def count(self) -> int:
-        return self._collection.count()
+    def count(self, where=None) -> int:
+        if not where:
+            return self._collection.count()
+        # ids-only, TANPA metadatas/documents/embeddings -- lebih murah dari get() biasa
+        return len(self._collection.get(where=where, include=[]).get("ids", []))
 
 
 # ==========================================
 # --- BACKEND: MILVUS ---
 # ==========================================
 class MilvusAdapter(VectorStoreAdapter):
-    """
-    Backend Milvus (server-based) -- cocok utk skala produksi/multi-instance
-    (skill library diakses dari BANYAK proses/VM/replika backend sekaligus,
-    beda dgn ChromaDB PersistentClient yang pada dasarnya single-writer/
-    single-process di satu direktori disk).
-
-    Butuh dependency tambahan: `pip install pymilvus` (SENGAJA di-import
-    lazy di `__init__`, BUKAN di top-level file ini, supaya siapa pun yang
-    tetap pakai ChromaDB TIDAK wajib install pymilvus).
-
-    Skema koleksi:
-      - id        : VARCHAR (primary key) -- uuid skill, sama seperti Chroma
-      - embedding : FLOAT_VECTOR(dim=<embedding_dim>, di-probe otomatis
-                    dari embedding function yang dipakai, lihat skill_lib.py)
-      - document  : VARCHAR -- deskripsi_task
-      - metadata  : JSON -- SEMUA field metadata (trace, catatan_hasil,
-                    status, skor, rag_candidates_trace, ts) ditaruh di SATU
-                    field JSON supaya skema tetap fleksibel persis seperti
-                    metadata dict bebas-bentuk di Chroma, tanpa perlu
-                    migrasi skema tiap kali skill_lib.py nambah field
-                    metadata baru (butuh Milvus >= 2.4 utk tipe data JSON).
-
-    Index: AUTOINDEX + metric_type COSINE -- disamakan dgn 2 adapter lain
-    (lihat catatan semantik distance di VectorStoreAdapter).
-    """
-
     def __init__(
         self,
         embedding_dim: int,
@@ -242,36 +194,22 @@ class MilvusAdapter(VectorStoreAdapter):
         if ids:
             self._client.delete(collection_name=self._collection_name, ids=list(ids))
 
-    def count(self) -> int:
-        stats = self._client.get_collection_stats(self._collection_name)
-        return int(stats.get("row_count", 0))
+    def count(self, where=None) -> int:
+        if not where:
+            stats = self._client.get_collection_stats(self._collection_name)
+            return int(stats.get("row_count", 0))
+        hasil = self._client.query(
+            collection_name=self._collection_name,
+            filter=self._bangun_filter_expr(where),
+            output_fields=["id"],
+        )
+        return len(hasil)
 
 
 # ==========================================
 # --- BACKEND: POSTGRES + PGVECTOR ---
 # ==========================================
 class PgVectorAdapter(VectorStoreAdapter):
-    """
-    Backend Postgres + ekstensi `pgvector` -- cocok kalau tim sudah punya
-    infrastruktur Postgres (mis. sama dgn DB aplikasi lain, termasuk yang
-    dipakai tim CS) dan mau skill library numpang di situ tanpa nambah
-    komponen infra baru (beda dgn Milvus yang butuh service server terpisah).
-
-    Butuh dependency tambahan: `pip install psycopg2-binary pgvector`, DAN
-    privilege `CREATE EXTENSION`/`CREATE TABLE` pada koneksi pertama kali
-    dipakai (kalau connection user tidak punya privilege itu, minta DBA
-    jalankan `CREATE EXTENSION IF NOT EXISTS vector;` + biarkan adapter ini
-    yang bikin tabelnya, atau bikin tabel manual sesuai skema di bawah).
-
-    Tabel (dibuat otomatis kalau belum ada):
-        id          TEXT PRIMARY KEY
-        document    TEXT
-        embedding   VECTOR(<embedding_dim>)
-        metadata    JSONB
-    Index: HNSW dgn `vector_cosine_ops` -- metric SAMA (cosine) dgn 2
-    adapter lain (lihat catatan semantik distance di VectorStoreAdapter).
-    """
-
     def __init__(self, embedding_dim: int, dsn: str, table_name: str = "agent_skills"):
         import psycopg2
         import psycopg2.extras
@@ -345,9 +283,12 @@ class PgVectorAdapter(VectorStoreAdapter):
         with self._conn.cursor() as cur:
             cur.execute(f"DELETE FROM {self._table} WHERE id = ANY(%s);", (list(ids),))
 
-    def count(self) -> int:
+    def count(self, where=None) -> int:
+        k, v = _filter_tunggal(where)
+        klausa_where = "WHERE metadata->>%s = %s" if k is not None else ""
+        params = [k, str(v)] if k is not None else []
         with self._conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM {self._table};")
+            cur.execute(f"SELECT COUNT(*) FROM {self._table} {klausa_where};", params)
             return cur.fetchone()[0]
 
 

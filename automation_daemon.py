@@ -1,17 +1,3 @@
-"""
-Daemon TERPISAH dari proses Streamlit UI dan proses agent chat utama.
-Jalankan manual: `python -m core_agent.automation_daemon` (atau sesuaikan
-cara run modul di project kamu).
-
-KENAPA PROSES TERPISAH (bukan thread di dalam Streamlit):
-- Streamlit re-run seluruh script tiap ada interaksi UI -- bahaya kalau
-  scheduler nempel di situ (bisa restart/dobel tiap kali UI di-refresh).
-- Daemon ini TIDAK butuh LLM/AIBrainProcessor sama sekali -- automation
-  cuma manggil tool yang SUDAH ditentukan+diisi argumennya di UI (lihat
-  tab3_automation.py), bukan agent yang "mikir" mau manggil tool apa.
-  Makanya daemon ini ringan: cuma butuh ToolRegistry + plugin ke-load,
-  gak perlu Ollama/Groq/skill_lib nyala sama sekali.
-"""
 import time
 import threading
 import datetime

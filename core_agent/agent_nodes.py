@@ -1,3 +1,4 @@
+import math
 import operator
 import random
 import re
@@ -7,6 +8,7 @@ from typing import Annotated, TypedDict, Any, Optional
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, RemoveMessage#, SystemMessage
 from langgraph.graph.message import add_messages
+from core_agent.agent_factory.voyager.skill_lib import format_trace_polos, format_trace_proba_heuristik, format_trace_proba_llm
 
 PREFIX_NUDGE_SISTEM = (
     "[SISTEM", "[INFO SISTEM", "[PERINGATAN SISTEM",
@@ -115,18 +117,6 @@ class AgentState(TypedDict):
 # --- 2. SUB-KOMPONEN SPESIALISASI ---
 # ==========================================
 class SkillLibraryOrchestrator:
-    """
-    Membungkus semua interaksi dengan SkillLibrary (Voyager-style):
-      - Cari skill relevan (sukses & gagal) untuk task yang sedang berjalan.
-      - Putuskan (atau lanjutkan keputusan lama) mode eksplorasi vs eksploitasi.
-      - Format keduanya jadi pesan yang disisipkan ke prompt.
-      - Simpan skill baru saat trace task selesai (reward/gagal), atau buang
-        jejaknya saat task dibatalkan (tools_batal).
-
-    Kalau `skill_library` None, instance ini otomatis jadi no-op (`.aktif`
-    False) -- AIBrainProcessor tidak perlu cek None di banyak tempat lagi.
-    """
-
     def __init__(
         self,
         skill_library: Any = None,
@@ -139,8 +129,11 @@ class SkillLibraryOrchestrator:
         min_skor_toexplore: int = 80,
         max_skor_toexplore: int = 90,
         probabilitas_perskill_desccutoff: int = 100,
-        # --- [BARU] Toggle PENULISAN skill baru, TERPISAH dari retrieval ---
         mode_tulis_skill_default: bool = True,
+        C_UCB: float = 0.15,
+        epsilon_min: float = 0.05,
+        bobot_efisiensi: float = 0.2,
+        cap_bonus_efisiensi: float = 0.4,
     ):
         self.skill_library = skill_library
         self.top_k_skill = top_k_skill
@@ -154,6 +147,11 @@ class SkillLibraryOrchestrator:
         self.probabilitas_perskill_desccutoff = probabilitas_perskill_desccutoff
 
         self.mode_tulis_skill_default = mode_tulis_skill_default
+
+        self.C_UCB = C_UCB
+        self.epsilon_min = epsilon_min
+        self.bobot_efisiensi = bobot_efisiensi
+        self.cap_bonus_efisiensi = cap_bonus_efisiensi
 
     @property
     def aktif(self) -> bool:
@@ -172,11 +170,26 @@ class SkillLibraryOrchestrator:
         #  seperti dibawah, akan sangat kecil kemungkinan Agent akan memperoleh path yang sempurna.
         skor = s.get("skor", 0)
         sim = s.get("similarity", 0)
+
         if skor < self.min_skor_toexplore or sim < self.AMBANG_SIMILARITY_RENDAH:
-            return 1.0
-        if skor >= self.max_skor_toexplore and sim >= self.AMBANG_SIMILARITY_TINGGI:
-            return 0.0
-        return 0.5
+            base = 1.0
+        elif skor >= self.max_skor_toexplore and sim >= self.AMBANG_SIMILARITY_TINGGI:
+            base = 0.0
+        else:
+            base = 0.5
+
+        n_konfirmasi = s.get("n_konfirmasi") or 1
+        bonus_confidence = self.C_UCB / (max(n_konfirmasi, 1) ** 0.5)
+
+        bonus_efisiensi = 0.0
+        langkah_minimum = s.get("langkah_minimum_diketahui")
+        langkah_ini = len(s.get("trace", []))
+        if langkah_minimum and langkah_ini > langkah_minimum:
+            rasio_boros = langkah_ini / langkah_minimum
+            bonus_efisiensi = min(self.cap_bonus_efisiensi, (rasio_boros - 1) * self.bobot_efisiensi)
+
+        probabilitas = base + bonus_confidence + bonus_efisiensi
+        return max(self.epsilon_min, min(1.0, probabilitas))
 
     def cari_sukses(self, current_task_desc: str) -> list:
         if not (self.aktif and current_task_desc):
@@ -212,6 +225,7 @@ class SkillLibraryOrchestrator:
             "mode_eksplorasi_aktif": False,
             "mode_eksplorasi_baru_diputuskan": False,
             "skills_sukses": [],
+            "skills_sukses_asli": [],
             "skills_gagal": [],
         }
         if not (self.aktif and current_task_desc):
@@ -243,6 +257,8 @@ class SkillLibraryOrchestrator:
                 f"{'EKSPLORASI (skill sukses disembunyikan)' if mode_eksplorasi_aktif else 'eksploitasi normal (skill sukses ditampilkan)'}"
             )
 
+        skills_sukses_asli = skills_sukses  # [BARU] simpan SEBELUM dikosongkan -- lihat alasan di key skills_sukses_asli
+
         if mode_eksplorasi_aktif:
             skills_sukses = []
 
@@ -266,6 +282,7 @@ class SkillLibraryOrchestrator:
             "mode_eksplorasi_aktif": mode_eksplorasi_aktif,
             "mode_eksplorasi_baru_diputuskan": mode_eksplorasi_baru_diputuskan,
             "skills_sukses": skills_sukses,
+            "skills_sukses_asli": skills_sukses_asli,
             "skills_gagal": skills_gagal,
         }
 
@@ -327,6 +344,12 @@ class SkillLibraryOrchestrator:
         except (ValueError, TypeError):
             skor_nilai = 0
 
+        ringkasan_confidence = ringkas_confidence_trace(current_skill_trace)
+        print(f"\n[📊 Confidence Trace] Ringkasan giliran task ini: {ringkasan_confidence}")
+        print(f"  trace                : {format_trace_polos(current_skill_trace)}")
+        print(f"  trace_proba_heuristik: {format_trace_proba_heuristik(current_skill_trace)}")
+        print(f"  trace_proba_llm      : {format_trace_proba_llm(current_skill_trace)}")
+
         self.skill_library.simpan_skill(
             deskripsi_task=current_task_desc or "(deskripsi task tidak diset)",
             trace=current_skill_trace,
@@ -334,6 +357,7 @@ class SkillLibraryOrchestrator:
             status=status,
             skor=skor_nilai,
             rag_candidates_trace=current_rag_candidates_trace or [],
+            ringkasan_confidence=ringkasan_confidence,
         )
         return self.reset_task_state()
 
@@ -572,6 +596,311 @@ class GorillaToolSelector:
         )
 
 
+# ==========================================
+# --- METRIK CONFIDENCE TOOL-SELECTION [BARU] ---
+# ==========================================
+def hitung_confidence_dari_logprobs(nama_tool: str, token_logprob_list: list) -> Optional[dict]:
+    if not token_logprob_list:
+        return None
+
+    teks_gabungan = ""
+    peta_posisi = []
+    for tok in token_logprob_list:
+        s = tok.get("token", "") or ""
+        start = len(teks_gabungan)
+        teks_gabungan += s
+        peta_posisi.append((start, len(teks_gabungan)))
+
+    idx_mulai = teks_gabungan.find(nama_tool)
+    if idx_mulai == -1:
+        return None  # nama tool tidak ketemu literal di stream token -- jangan maksa nebak, mundur ke heuristik
+    idx_akhir = idx_mulai + len(nama_tool)
+
+    logprobs_terkait = []
+    token_pertama_span = None
+    for i, (start, end) in enumerate(peta_posisi):
+        if end <= idx_mulai or start >= idx_akhir:
+            continue
+        tok = token_logprob_list[i]
+        if tok.get("logprob") is not None:
+            logprobs_terkait.append(tok["logprob"])
+        if token_pertama_span is None:
+            token_pertama_span = tok
+
+    if not logprobs_terkait:
+        return None
+
+    rata_logprob = sum(logprobs_terkait) / len(logprobs_terkait)
+    skor_confidence = math.exp(rata_logprob)  # geometric-mean probability per token di span nama tool
+
+    margin = None
+    if token_pertama_span:
+        alts = token_pertama_span.get("top_logprobs", []) or []
+        probs = sorted((a.get("logprob", float("-inf")) for a in alts), reverse=True)
+        if len(probs) >= 2 and probs[0] > float("-inf") and probs[1] > float("-inf"):
+            margin = math.exp(probs[0]) - math.exp(probs[1])
+
+    return {
+        "skor_confidence": round(skor_confidence, 4),
+        "margin_top1_top2": round(margin, 4) if margin is not None else None,
+    }
+
+
+def hitung_confidence_tool_call(
+    nama_tool: str,
+    tools_relevan: list,
+    tool_sebelumnya: Optional[str],
+    skill_referensi_trace: Optional[list],
+    index_step_ini: int,
+    jumlah_pengulangan_berturut_turut: int = 0,
+    logprob_data: Optional[list] = None,
+) -> dict:
+    rank = None
+    for i, t in enumerate(tools_relevan or []):
+        nama_kandidat = getattr(t, "name", None)
+        if nama_kandidat is None and isinstance(t, dict):
+            nama_kandidat = t.get("name")
+        if nama_kandidat == nama_tool:
+            rank = i + 1
+            break
+
+    cocok_skill_referensi = None
+    if skill_referensi_trace and index_step_ini < len(skill_referensi_trace):
+        entry_ref = skill_referensi_trace[index_step_ini]
+        nama_ref = entry_ref.get("name") if isinstance(entry_ref, dict) else None
+        if nama_ref is not None:
+            cocok_skill_referensi = (nama_ref == nama_tool)
+
+    # --- 1. Base dari rank ---
+    if rank is not None:
+        skor = max(0.30, 1.0 - 0.15 * (rank - 1))
+    elif tools_relevan:
+        skor = 0.25
+    else:
+        skor = 0.50
+
+    # --- 2. Kesesuaian dgn skill referensi ---
+    if cocok_skill_referensi is True:
+        skor = min(1.0, skor + 0.10)
+    elif cocok_skill_referensi is False:
+        skor = max(0.0, skor - 0.15)
+
+    hasil = {
+        "metode": "heuristik",
+        "skor_confidence": round(skor, 4),          # SELALU heuristik, TIDAK PERNAH ditimpa
+        "skor_confidence_llm": None,                 # [BARU] terisi HANYA kalau logprob_data tersedia
+        "margin_top1_top2_llm": None,                # [BARU] idem
+        "rank_di_tool_rag": rank,
+        "di_luar_shortlist_rag": bool(tools_relevan) and rank is None,
+        "tool_sebelumnya": tool_sebelumnya,
+        "cocok_skill_referensi": cocok_skill_referensi,
+        "jumlah_pengulangan_berturut_turut": jumlah_pengulangan_berturut_turut,
+    }
+
+    if logprob_data:
+        tambahan = hitung_confidence_dari_logprobs(nama_tool, logprob_data)
+        if tambahan:
+            hasil["skor_confidence_llm"] = tambahan["skor_confidence"]
+            hasil["margin_top1_top2_llm"] = tambahan.get("margin_top1_top2")
+            hasil["metode"] = "heuristik+logprob"  # KEDUANYA ada, bukan salah satu menimpa
+
+    return hasil
+
+
+def ringkas_confidence_trace(trace: list) -> dict:
+    entries = [e for e in (trace or []) if isinstance(e, dict) and isinstance(e.get("confidence"), dict)]
+    if not entries:
+        return {"jumlah_langkah_ada_confidence": 0}
+
+    skor_list = [e["confidence"]["skor_confidence"] for e in entries if e["confidence"].get("skor_confidence") is not None]
+    skor_llm_list = [e["confidence"]["skor_confidence_llm"] for e in entries if e["confidence"].get("skor_confidence_llm") is not None]
+    diluar_shortlist = sum(1 for e in entries if e["confidence"].get("di_luar_shortlist_rag"))
+    tidak_cocok_referensi = sum(1 for e in entries if e["confidence"].get("cocok_skill_referensi") is False)
+    langkah_berulang = sum(1 for e in entries if (e["confidence"].get("jumlah_pengulangan_berturut_turut") or 0) > 0)
+
+    return {
+        "jumlah_langkah_ada_confidence": len(entries),
+        "rata_rata_skor_confidence": round(sum(skor_list) / len(skor_list), 4) if skor_list else None,
+        "rata_rata_skor_confidence_llm": round(sum(skor_llm_list) / len(skor_llm_list), 4) if skor_llm_list else None,
+        "jumlah_langkah_di_luar_shortlist_rag": diluar_shortlist,
+        "jumlah_langkah_beda_dari_skill_referensi": tidak_cocok_referensi,
+        "jumlah_langkah_pengulangan_tool_sama": langkah_berulang,
+    }
+
+
+class PatternOrchestrator:
+    def __init__(
+        self,
+        pattern_library: Any = None,
+        llm_abstraksi: Any = None,      # idealnya fast_llm -- dipakai SEKALI per pola baru, bukan tiap retrieval
+        top_k_pola: int = 2,
+        min_similarity_pola: float = 0.72,
+        panjang_gram_min: int = 2,
+        panjang_gram_max: int = 4,
+        min_support: int = 3,            # gram harus muncul >= sekian KALI total
+        min_distinct_task: int = 2,      # DAN di >= sekian task BERBEDA (bukti generalisasi, bukan kebetulan 1 task)
+        interval_mining: int = 5,        # mining ulang tiap N skill BARU berstatus 'berhasil' tersimpan
+    ):
+        self.pattern_library = pattern_library
+        self.llm_abstraksi = llm_abstraksi
+        self.top_k_pola = top_k_pola
+        self.min_similarity_pola = min_similarity_pola
+        self.panjang_gram_min = panjang_gram_min
+        self.panjang_gram_max = panjang_gram_max
+        self.min_support = min_support
+        self.min_distinct_task = min_distinct_task
+        self.interval_mining = interval_mining
+
+    @property
+    def aktif(self) -> bool:
+        return self.pattern_library is not None
+
+    # -------------------------------------
+    # RETRIEVAL (dipanggil tiap giliran, lewat thread-pool paralel spt
+    # cari_sukses/cari_gagal -- lihat AIBrainProcessor._jalankan_io_paralel)
+    # -------------------------------------
+    def cari_pola(self, current_task_desc: str) -> list:
+        if not (self.aktif and current_task_desc):
+            return []
+        try:
+            hasil = self.pattern_library.cari_pola_relevan(
+                current_task_desc, top_k=self.top_k_pola, min_similarity=self.min_similarity_pola,
+            )
+        except Exception as e:
+            print(f"\n[⚠️ Pattern Library] Gagal cari pola relevan ({e}) -- lanjut tanpa itu giliran ini.")
+            return []
+        if hasil:
+            print(f"\n [Orchestrator] didapatkan pola lintas-task: {hasil}")
+        return hasil
+
+    def rakit_context_pola(self, pola_list: list) -> list:
+        """Format pola jadi pesan TERPISAH dari blok skill library -- sengaja
+        dibedakan bahasanya (\"prinsip\" bukan \"contoh pendekatan\") supaya
+        LLM tidak menyamakan bobotnya dgn skill yg task-nya benar-benar sama."""
+        if not pola_list:
+            return []
+        blok = [
+            "--- POLA UMUM LINTAS-TASK (PRINSIP, BUKAN RESEP) ---",
+            "⚠️ Ini prinsip yang terbukti berguna di BEBERAPA task BERBEDA "
+            "sebelumnya (bukan task yang sama persis dengan sekarang) -- "
+            "jadikan INSPIRASI pendekatan kalau relevan, BUKAN langkah yang "
+            "wajib ditiru kalau konteksnya tidak cocok:",
+        ]
+        for i, p in enumerate(pola_list, 1):
+            jumlah_task = len(p.get("task_asal", []))
+            blok.append(
+                f"  [Pola {i} | Sim: {p['similarity']} | pernah muncul di {jumlah_task} task berbeda] "
+                f"{p['deskripsi_abstrak']}"
+            )
+        teks = "\n".join(blok)
+        return [HumanMessage(content=f"[INFO SISTEM]\n{teks}")]
+
+    # -------------------------------------
+    # MINING (background -- TIDAK synchronous tiap giliran, cuma
+    # trigger tiap `interval_mining` skill BARU berstatus 'berhasil',
+    # dihitung dari WATERMARK DI STORAGE -- lihat catatan multi-proses)
+    # -------------------------------------
+    def mining_jika_perlu(self, skill_library: Any) -> None:
+        if not (self.aktif and skill_library is not None):
+            return
+        try:
+            total_berhasil = skill_library.hitung_skill(status_filter="berhasil")
+            watermark = self.pattern_library.ambil_watermark_mining()
+        except Exception as e:
+            print(f"\n[⚠️ Pattern Library] Gagal baca watermark/hitung skill ({e}) -- mining dilewati giliran ini.")
+            return
+
+        if total_berhasil - watermark < self.interval_mining:
+            return
+
+        # Update watermark DULU (persempit jendela race), baru mining jalan.
+        try:
+            self.pattern_library.set_watermark_mining(total_berhasil)
+        except Exception as e:
+            print(f"\n[⚠️ Pattern Library] Gagal update watermark ({e}) -- mining dilewati giliran ini (hindari mining tanpa watermark ke-update -> bisa re-trigger terus tiap giliran).")
+            return
+
+        try:
+            self._jalankan_mining(skill_library)
+        except Exception as e:
+            print(f"\n[⚠️ Pattern Library] Mining gagal ({e}) -- watermark SUDAH ter-update, akan nyoba lagi di interval berikutnya.")
+
+    def _jalankan_mining(self, skill_library: Any) -> None:
+        semua_entry = skill_library.semua_skill_untuk_mining(status_filter="berhasil")
+        if not semua_entry:
+            return
+
+        # --- Hitung frekuensi n-gram nama_tool lintas SEMUA trace sukses ---
+        hitung = {}
+        for entry in semua_entry:
+            trace = entry.get("trace", [])
+            nama_urut = [t.get("name") for t in trace if isinstance(t, dict) and t.get("name")]
+            for n in range(self.panjang_gram_min, self.panjang_gram_max + 1):
+                for i in range(len(nama_urut) - n + 1):
+                    gram = tuple(nama_urut[i:i + n])
+                    slot = hitung.setdefault(gram, {"count": 0, "task_asal": set(), "contoh_entry": None})
+                    slot["count"] += 1
+                    slot["task_asal"].add(entry.get("deskripsi", ""))
+                    if slot["contoh_entry"] is None:
+                        slot["contoh_entry"] = entry
+
+        # --- Filter: harus berulang DAN muncul di task yg BERBEDA (bukti
+        # generalisasi, bukan sekadar repetisi task yang sama berkali-kali) ---
+        kandidat_baru = {
+            gram: v for gram, v in hitung.items()
+            if v["count"] >= self.min_support and len(v["task_asal"]) >= self.min_distinct_task
+        }
+
+        if not kandidat_baru:
+            print("\n[🔬 Pattern Mining] Tidak ada pola baru yang lolos ambang (support/distinct-task).")
+            return
+
+        print(f"\n[🔬 Pattern Mining] {len(kandidat_baru)} kandidat pola lintas-task ditemukan -- generate deskripsi abstrak...")
+        for gram, info in kandidat_baru.items():
+            deskripsi_abstrak = self._generate_deskripsi_abstrak(gram, info["contoh_entry"])
+            if not deskripsi_abstrak:
+                continue
+            self.pattern_library.simpan_pola(
+                gram=gram,
+                deskripsi_abstrak=deskripsi_abstrak,
+                task_asal=info["task_asal"],
+                support=info["count"],
+                contoh_entry=info["contoh_entry"],
+            )
+            print(
+                f"  -> Pola '{' -> '.join(gram)}' (support={info['count']}, "
+                f"{len(info['task_asal'])} task berbeda) disimpan sbg: \"{deskripsi_abstrak[:100]}\""
+            )
+
+    def _generate_deskripsi_abstrak(self, gram: tuple, contoh_entry: Optional[dict]) -> str:
+        if self.llm_abstraksi is None:
+            return f"Pola tool berulang lintas-task: {' -> '.join(gram)}"
+
+        contoh_teks = ""
+        if contoh_entry:
+            contoh_teks = f"\nContoh task tempat pola ini muncul: \"{contoh_entry.get('deskripsi', '')[:200]}\""
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "Kamu meringkas SATU prinsip umum dari urutan pemanggilan tool yang "
+             "berulang di banyak task BERBEDA pada AI agent. Tulis SATU kalimat "
+             "PRINSIP ABSTRAK (bukan resep spesifik task manapun) yang menjelaskan "
+             "KAPAN dan KENAPA urutan tool ini berguna -- generalisasikan supaya "
+             "bisa dipahami dan diterapkan untuk task lain yang berbeda topik tapi "
+             "punya struktur masalah serupa. Jangan sebut nama tool spesifik kalau "
+             "bisa diganti istilah umum (mis. 'verifikasi status koneksi' bukan "
+             "'panggil cek_inet'). Balas HANYA kalimat prinsipnya, tanpa embel-embel."
+            ),
+            ("user", f"Urutan tool yang berulang: {' -> '.join(gram)}{contoh_teks}"),
+        ])
+        try:
+            hasil = (prompt | self.llm_abstraksi).invoke({})
+            return (hasil.content or "").strip()
+        except Exception as e:
+            print(f"\n[⚠️ Pattern Library] Gagal generate deskripsi abstrak lewat LLM ({e}) -- pakai fallback nama tool mentah.")
+            return f"Pola tool berulang lintas-task: {' -> '.join(gram)}"
+
+
 def _geser_agar_tidak_memutus_pasangan_tool(semua_pesan_asli: list, titik_potong: int) -> int:
     while titik_potong > 0 and getattr(semua_pesan_asli[titik_potong], "type", None) == "tool":
         titik_potong -= 1
@@ -602,12 +931,6 @@ def hitung_perintah_hapus_pesan_lama(semua_pesan_asli: list, anchor_id: Optional
 
 
 def hapus_pesan_task_dibatalkan(messages_raw: list, anchor_id_lama: Optional[str]) -> list:
-    """
-    Menghapus dari anchor (inklusif) sampai SEBELUM pesan TERAKHIR (index -1,
-    yaitu ToolMessage konfirmasi tools_batal) -- pesan konfirmasi itu SENGAJA
-    dipertahankan, supaya model tetap tahu barusan ada aksi cancel, tapi
-    tanpa detail task lama yang memancingnya buat lanjut.
-    """
     if not anchor_id_lama or len(messages_raw) < 2:
         return []
     idx_anchor = next(

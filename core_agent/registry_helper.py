@@ -1,35 +1,5 @@
 from langchain_core.messages import AIMessage
 class FailsafeRegistry:
-    """
-    Registry untuk skenario GAGAL/FAILSAFE di dalam graf (mis. AI balik dengan
-    respons kosong berkali-kali). Polanya sengaja dibuat identik dengan
-    ToolRegistry & ToolFormatterRegistry: kontributor cukup pasang decorator
-    di file plugin masing-masing (folder `plugins/`, ke-scan otomatis oleh
-    AUTO-DISCOVERY di agent_factory.py) -- TIDAK PERLU membuka atau mengubah
-    core system (agent_nodes.py) sama sekali untuk mengganti perilaku failsafe.
-
-    Setiap skenario diberi `kode` unik (mis. "kosong" untuk kasus respons AI
-    kosong berulang). Kalau tidak ada handler custom terdaftar untuk kode itu
-    -- atau handler-nya error -- sistem otomatis jatuh ke default bawaan yang
-    dikirim oleh si pemanggil (node core), jadi node core TETAP JALAN NORMAL
-    walau belum ada satupun plugin failsafe terpasang.
-
-    Cara pakai di file plugin:
-
-        from core_agent.registry import FailsafeRegistry
-
-        @FailsafeRegistry.register("kosong")
-        def pesan_kosong_versi_saya(state) -> str:
-            return "Pesan custom kamu di sini, boleh baca `state` juga."
-
-    Untuk kontrol penuh (bukan cuma ganti teks -- misal mau nambah field state
-    lain, trigger notifikasi, dst), handler boleh return dict langsung; dict
-    itu dipakai APA ADANYA sebagai update state LangGraph:
-
-        @FailsafeRegistry.register("kosong")
-        def handler_lanjutan(state) -> dict:
-            return {"messages": [...], "revision_count": 0, "pending_tasks": ""}
-    """
     _handlers = {}
 
     KODE_KOSONG = "kosong"
@@ -77,42 +47,6 @@ class FailsafeRegistry:
             return default_update
 
 class GuardrailRegistry:
-    """
-    Registry untuk validasi ARGUMEN tool call SEBELUM tool-nya benar-benar
-    dieksekusi -- didaftarkan PER KATEGORI (mis. "pentest"), bukan per tool
-    satu-satu, supaya proteksi konsisten untuk semua tool dalam kategori yang
-    sama tanpa perlu duplikasi validasi di tiap file tool.
-
-    Pola sengaja dibuat identik dengan FailsafeRegistry & SmokeTestRegistry:
-    kontributor cukup pasang decorator di file plugin masing-masing --
-    TIDAK PERLU membuka atau mengubah core (agent_router.py/agent_nodes.py)
-    untuk menambah/mengganti aturan validasi.
-
-    Cara pakai di file plugin:
-
-        from core_agent.registry import GuardrailRegistry
-
-        @GuardrailRegistry.register("pentest")
-        def validasi_pentest(nama_tool: str, args: dict) -> str | None:
-            # return None kalau lolos, atau STRING ALASAN PENOLAKAN kalau ditolak.
-            # String itu yang akan dikirim balik ke LLM sebagai ToolMessage,
-            # menggantikan eksekusi tool yang sesungguhnya.
-            if "DROP TABLE" in str(args).upper():
-                return f"Tool '{nama_tool}' ditolak: argumen menyerupai payload SQLi."
-            return None
-
-    Kalau tidak ada handler terdaftar untuk sebuah kategori, semua tool call
-    di kategori itu otomatis LOLOS tanpa validasi tambahan (opt-in per
-    kategori -- kategori yang belum didaftarkan guardrail-nya tetap jalan
-    normal seperti sebelumnya, tidak mengubah perilaku existing).
-
-    PENTING: registry ini cuma menyimpan & memanggil fungsi validasi. Node
-    LangGraph yang benar-benar mengeksekusi tool untuk kategori "pentest"
-    (atau kategori lain yang mau divalidasi) harus memanggil
-    `GuardrailRegistry.check(kategori, nama_tool, args)` untuk SETIAP
-    tool_call SEBELUM menjalankan tool-nya, dan kalau hasilnya bukan None,
-    kirim itu sebagai ToolMessage lalu SKIP eksekusi tool yang sesungguhnya.
-    """
     _guardrails = {}
 
     @classmethod

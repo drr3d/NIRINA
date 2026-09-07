@@ -300,24 +300,6 @@ class ToolRegistry:
     @classmethod
     def _klasifikasi_exact_match(cls, query_tokens: set, tool, df_token: dict, ambang_df: int = 1,
                                   ambang_cakupan: float = 0.66):
-        """Klasifikasikan exact-name-match tool ini jadi "kuat" atau "lemah".
-
-        KUAT (dijamin masuk, TIDAK dibatasi top_k -- mirip _tools_wajib_selalu) kalau:
-          (a) ADA token overlap yang df-nya <= ambang_df (kata itu cuma dipunyai
-              ambang_df nama tool atau kurang -- default 1, artinya BENAR-BENAR
-              unik milik tool ini), ATAU
-          (b) cakupan overlap terhadap SELURUH token nama tool >= ambang_cakupan
-              (mayoritas kata di nama tool itu ada di query, meski masing-masing
-              kata sendirian generik -- mis. query bilang "scan port nmap" persis
-              menutupi ke-3 kata nama tool "scan_port_nmap").
-
-        LEMAH (exact-match tetap tercatat, tapi tunduk ke kompetisi RRF biasa
-        dan bisa ke-drop kalau slot penuh) kalau overlap ADA tapi TIDAK memenuhi
-        (a) maupun (b) -- biasanya cuma nyantol 1 kata generik doang, mis. "buat"
-        yang dipunyai banyak tool sekaligus (buat_exploit, buat_sqli_exploit).
-
-        Return: "kuat" | "lemah" | None (None = tidak exact-match sama sekali).
-        """
         nama_tokens = cls._tokenize(tool.name)
         overlap_nama = query_tokens & nama_tokens
         
@@ -368,12 +350,6 @@ class ToolRegistry:
 
     @classmethod
     def _generate_hyde_doc(cls, task_query: str, llm=None, all_tools=None) -> str:
-        """
-        [HyDE Engine] Transformasi kueri tugas pengguna (yang seringkali
-        pendek/ambigu) menjadi deskripsi fungsi hipotetis ideal, di-embed
-        ke ChromaDB berdampingan dengan embedding kueri asli.
-
-        """
         cache_key = (task_query or "").strip().lower()
         cached = cls._hyde_cache_get(cache_key)
         if cached is not None:
@@ -427,23 +403,6 @@ class ToolRegistry:
 
     @classmethod
     def _rerank_with_llm(cls, task_query: str, kandidat: list, llm, slot_tersisa: int) -> list:
-        """
-        [Contextual Retrieval -- Anthropic Technical Report, Sept 2024, prinsip #2]
-        LLM reranking atas kandidat yang SUDAH lolos RRF -- ini lever TERBESAR
-        di paper Anthropic (-67% retrieval failure dgn rerank, vs -49% tanpa
-        rerank, vs 0% baseline). Candidate pool di sistem ini kecil (belasan/
-        puluhan tool), jadi murah & cepat buat di-rerank pakai LLM.
-
-        BEDA dengan ringkasan kontekstual di atas: itu cost-nya SEKALI di
-        index-time (zero cost per giliran). Ini tetap 1x panggilan LLM per
-        giliran DI RETRIEVAL-TIME -- trade-off latency vs akurasi yang sama
-        seperti HyDE. Makanya OPT-IN lewat parameter `rerank=True` di
-        `get_relevant_tools`, bukan default.
-
-        FAIL-SAFE: kalau llm error atau responsnya tidak bisa di-parse jadi
-        urutan nomor valid, kembalikan `kandidat` apa adanya (urutan RRF
-        asli) -- reranking yang gagal TIDAK BOLEH menjatuhkan retrieval.
-        """
         if not kandidat or llm is None:
             return kandidat
 
@@ -489,46 +448,6 @@ class ToolRegistry:
                            ambang_df: int = 1, ambang_cakupan: float = 0.75,
                            mode: str = None, llm = None, phase: str = None,
                            rerank: bool = False):
-        """[HYBRID] Filter dinamis tool untuk disuapkan ke LLM -- gabungan semantic
-        search (ChromaDB embedding, nangkep kemiripan MAKNA) + lexical/keyword
-        exact-match (nangkep istilah teknis SPESIFIK yang sering dilewatkan
-        embedding model kecil), digabung lewat 3 lapis:
-
-        LAPIS 1 -- PROMOSI KERAS untuk EXACT-MATCH "KUAT" (lihat
-        `_klasifikasi_exact_match`): tool yang exact-match ke kata UNIK/langka
-        (bukan kata generik yang dipunyai banyak tool sekaligus) dijamin masuk,
-        TIDAK dibatasi top_k sama sekali -- persis kayak `_tools_wajib_selalu`.
-
-        Layer 2 -- RECIPROCAL RANK FUSION (RRF) untuk sisa slot: menggabungkan
-        ranking semantic & lexical (overlap nama+deskripsi, termasuk exact-match
-        LEMAH) berdasarkan URUTAN posisi, bukan nilai skor mentah -- supaya aman
-        walau distance metric ChromaDB di collection ini bukan cosine (lihat
-        catatan di `_collection` -- tidak diset `hnsw:space: cosine` seperti di
-        skill_lib.py). K_RRF dipakai kecil (bukan 60 seperti standar literatur
-        buat web-search skala ribuan dokumen) -- candidate pool kita cuma
-        belasan/puluhan tool, K besar bikin selisih antar-rank nyaris rata.
-
-        Layer 3 -- Tool wajib (`_tools_wajib_selalu`) tetap dipaksa masuk paling
-        akhir seperti sebelumnya, tidak berubah.
-
-        MODE (`mode` param, atau default kelas `_default_retrieval_mode`):
-          - "fusion" (DEFAULT BARU): semantic dari query ASLI + dokumen HyDE
-            SEKALIGUS, di-RRF bareng (bobot_semantic dibagi rata ke keduanya).
-            Kalau `llm` tidak dioper, otomatis setara "gorilla" murni (HyDE
-            di-skip, bukan diam-diam dianggap "sudah jalan").
-          - "hyde": HANYA dokumen hipotetis HyDE (exclusive, dipertahankan
-            untuk debugging/A-B test, BUKAN untuk pemakaian produksi biasa).
-          - "gorilla": HANYA query mentah (exclusive, sama alasan di atas).
-          - "contextual": query mentah + prefix fase pentest saat ini.
-
-        `rerank` (default False, OPT-IN): kalau True DAN `llm` dioper, slot
-        sisa (di luar exact-match "kuat") diisi lewat LLM reranking atas pool
-        kandidat RRF (lihat `_rerank_with_llm` -- prinsip #2 Contextual
-        Retrieval, lever terbesar di paper Anthropic tapi tetap 1x panggilan
-        LLM per giliran di retrieval-time, jadi tidak dijadikan default).
-        Kalau True tapi `llm=None`, otomatis diabaikan (fallback ke RRF biasa,
-        sama filosofi fallback seperti HyDE).
-        """
         all_public_tools = cls.get_all_tools()
 
         # Fallback: Jika tidak ada kueri atau tools terlalu sedikit, kembalikan semua
@@ -559,7 +478,7 @@ class ToolRegistry:
 
         # --- PERBAIKAN: EARLY EXIT (SHORT-CIRCUIT) ---
         # Jika tool yang cocok secara "kuat" sudah memenuhi atau melebihi target top_k,
-        # skip HyDE dan semantic search untuk menghemat waktu.
+        # Skip HyDE dan semantic search untuk menghemat waktu.
         if len(nama_exact_kuat) >= efektif_top_k:
             print(f"[⚡ Short-Circuit] Ditemukan {len(nama_exact_kuat)} exact-match kuat. Melewati proses HyDE dan Semantic RAG.")
             tools_terpilih = [tools_by_name[n] for n in list(nama_exact_kuat)[:efektif_top_k]]
