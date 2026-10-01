@@ -1,0 +1,24 @@
+# Runtime data (created when the app runs)
+/APPDB/
+/logs/
+
+# Local configuration and secrets
+.env
+.env.*
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local databases
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
