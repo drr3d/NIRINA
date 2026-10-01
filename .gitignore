@@ -1,0 +1,22 @@
+# build
+target/
+
+# konfigurasi lokal dan rahasia (jangan pernah di-commit)
+nigate.toml
+.env
+.env.*
+*.token
+*.pid
+
+# database SQLite (key store, statistik) beserta file pendampingnya
+*.db
+*.db-*
+*.db-shm
+*.db-wal
+
+# log
+*.log
+
+# Python (dashboard di ui/)
+__pycache__/
+*.pyc

@@ -1,0 +1,109 @@
+# Copy to nigate.toml and adjust, for example:  cp nigate.example.toml nigate.toml
+# Run directly on the host:  cargo run --release -- -c nigate.toml   (or ./target/release/nigate -c nigate.toml)
+# Provider keys are NOT written here: supply them through the environment (the variable name is set by api_key_env),
+# for example CEREBRAS_API_KEY for the first upstream below. An upstream whose key variable is empty is skipped;
+# an upstream without api_key_env (for example a local Ollama) is still used.
+
+[server]
+listen = "127.0.0.1:4000"   # loopback only; expose it to other networks ("0.0.0.0:4000") only deliberately
+max_body_mb = 10
+
+[auth]
+required = true             # false = /v1/* is open without a key (local development only)
+
+[limits]
+# Per-key defaults per minute (delete a line = unlimited). Limits for one key are set with:
+#   nigate key limit <name> --rpm 60 --tpm 100000     (a number or 'none')
+# TPM is soft: it is checked against an estimate of the input tokens, then corrected with the real usage of the response.
+# default_rpm = 60
+# default_tpm = 100000
+
+[resilience]
+# Failover between upstreams of one alias: the order of the [[model.upstream]] blocks is the priority order.
+# Transient errors (connection, timeout, 5xx) are retried on the same upstream; 429/401/403 move on at once.
+# Client errors (400/404/422) are passed through unchanged. A failed upstream is skipped during the cooldown
+# (a provider 429 uses its Retry-After), but it is still tried when there is no other choice.
+max_retries = 1
+retry_backoff_ms = 200
+cooldown_secs = 30
+total_timeout_secs = 300     # budget for all attempts and failovers of one request
+
+[stats]
+# Usage statistics per request (metadata only: key, alias, upstream, status, tokens, latency; prompt and
+# completion text is NOT stored). Written in batches to a file separate from the key database. See: nigate stats --hari 7 --per key
+enabled = true
+db_path = "nigate-stats.db"
+retention_days = 30          # older data is deleted automatically
+
+[guardrail]
+# Two-way secret filter: prompts going out to the provider and answers coming back to the client.
+# Only content fields are scanned (content, reasoning, tool_calls arguments, role "tool" messages); id/model/name are left alone.
+enabled = true
+mode = "redact"              # redact = replace with [REDACTED:<rule>] | block = reject | log_only = count only (trial period)
+scan_request = true
+scan_response = true
+entropy = true               # detects random-looking tokens (unknown keys). Pure hex (hashes, commit ids) passes on purpose.
+entropy_min_length = 32
+entropy_threshold = 4.5      # bits per character; raise it if you see too many false positives
+
+# Per-rule mode ("aksi" = action), overrides `mode`. A wrong rule name fails startup, so a typo cannot silently disable protection.
+# Built-in rules: private_key aws_access_key aws_secret_key github_token sk_api_key cerebras_key groq_key
+#   nigate_key slack_token google_api_key stripe_key jwt bearer_token url_credentials secret_assignment high_entropy
+[guardrail.aksi]
+private_key = "block"
+
+# Extra rules of your own (regex; if there is a capture group, only group 1 is replaced).
+# [[guardrail.rule]]
+# name = "project_code"
+# pattern = "PRJ-[0-9]{8}"
+# mode = "block"
+
+# Test the rules on text without running the gateway:  echo "some text" | nigate guardrail cek
+
+[admin]
+# Admin API (for the Streamlit dashboard and operators) on a listener SEPARATE from the chat path.
+# It runs only when a token exists: create one with `nigate admin token`, then set it as env NIGATE_ADMIN_TOKEN (at least 24 characters).
+# No token = no admin door at all. Endpoints: /admin/health|config|reload|keys|upstreams|stats|guardrail/events
+enabled = true
+listen = "127.0.0.1:4001"    # keep it on loopback; do not open the admin API to the network
+token_env = "NIGATE_ADMIN_TOKEN"
+# POST /admin/reload re-reads this file without a restart (models/upstreams, resilience, limits, guardrail, auth.required).
+# Settings tied to open resources (server.listen, max_body_mb, storage/stats paths, admin) need a restart and are reported.
+
+[storage]
+# Virtual keys are stored here (hashes only). Use an absolute path when the gateway runs as a service.
+db_path = "nigate.db"
+
+# One [[model]] = one alias that clients pass in the "model" field.
+[[model]]
+alias = "chat-main"
+
+  [[model.upstream]]
+  name = "primary"                                     # shown in the x-nigate-upstream header and in logs
+  base_url = "https://api.cerebras.ai/v1"
+  model = "qwen-3-235b-a22b-instruct-2507"
+  api_key_env = "CEREBRAS_API_KEY"
+  timeout_secs = 120
+
+  # Backup: used when the upstream above fails. It may be another provider and another model name.
+  [[model.upstream]]
+  name = "local-backup"                                # shown in the x-nigate-upstream header and in logs
+  base_url = "http://127.0.0.1:11434/v1"               # Ollama on the same machine (OpenAI-compatible), no key
+  model = "qwen3.5-9b-q4_k_m:latest"                   # replace with a model you have pulled (see: ollama list)
+  timeout_secs = 300
+
+  # Example of a second cloud backup (remove the leading # and set env GROQ_API_KEY):
+  # [[model.upstream]]
+  # name = "cloud-backup"
+  # base_url = "https://api.groq.com/openai/v1"
+  # model = "llama-3.3-70b-versatile"
+  # api_key_env = "GROQ_API_KEY"
+  # timeout_secs = 120
+
+[[model]]
+alias = "chat-local"
+
+  [[model.upstream]]
+  base_url = "http://127.0.0.1:11434/v1"              # Ollama (OpenAI-compatible), no key
+  model = "qwen3.5-9b-q4_k_m:latest"
+  timeout_secs = 300
