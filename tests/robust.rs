@@ -102,7 +102,14 @@ async fn usage_u64_maksimum_tidak_membalik_tanda_dan_tidak_panik() {
 // ---------- ukuran respons upstream ----------
 
 fn upstream_besar(byte: usize) -> Router {
-    Router::new().route("/v1/chat/completions", post(move || async move { "x".repeat(byte) }))
+    Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move {
+            // JSON sah berukuran `byte`: upstream yang menjawab 2xx wajib berupa objek JSON.
+            let isi = format!(r#"{{"choices":[],"pad":"{}"}}"#, "x".repeat(byte.saturating_sub(24)));
+            ([(axum::http::header::CONTENT_TYPE, "application/json")], isi)
+        }),
+    )
 }
 
 async fn chat_biasa(r: &Router, token: &str) -> (StatusCode, String) {
@@ -223,7 +230,7 @@ fn pembatas_log_membatasi_satu_pesan_per_selang() {
 #[test]
 fn config_batas_respons_dan_tenggang_shutdown_divalidasi() {
     let c = Config::from_toml_str("", &|_| None).unwrap();
-    assert_eq!((c.max_response_bytes, c.shutdown_grace), (32 * 1024 * 1024, Duration::from_secs(30)));
+    assert_eq!((c.max_response_bytes, c.shutdown_grace), (8 * 1024 * 1024, Duration::from_secs(30)));
     for buruk in ["max_response_mb = 0", "max_response_mb = 257", "shutdown_grace_secs = 0", "shutdown_grace_secs = 301"] {
         assert!(Config::from_toml_str(&format!("[server]\n{buruk}\n"), &|_| None).is_err(), "harus ditolak: {buruk}");
     }

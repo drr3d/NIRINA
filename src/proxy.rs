@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -55,6 +58,8 @@ impl AppState {
             .pool_max_idle_per_host(32)
             .tcp_keepalive(Duration::from_secs(60))
             .tcp_nodelay(true)
+            // Redirect tidak diikuti: reqwest akan mengulang body POST (berisi prompt) ke alamat yang ditunjuk upstream.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let guardrail = Guardrail::baru(&config.guardrail)?;
         Ok(Self {
@@ -190,6 +195,38 @@ async fn saring_request(rt: &Arc<Runtime>, req: Value, besar: bool) -> Result<(V
     .await
 }
 
+/// Mengembalikan estimasi TPM yang sudah dipakai bila request berhenti sebelum selesai. Contohnya klien menutup koneksi:
+/// handler dibatalkan di tengah `await` dan kode sesudahnya tidak pernah berjalan, jadi pengembalian dilakukan lewat `Drop`.
+/// Dilepas (`lepas`) begitu jatah sudah dikoreksi dengan `usage` asli.
+struct JatahGuard {
+    limiter: Arc<Limiter>,
+    key_id: i64,
+    estimasi: u64,
+    aktif: AtomicBool,
+}
+
+impl JatahGuard {
+    fn baru(limiter: &Arc<Limiter>, key_id: i64, estimasi: u64) -> Self {
+        Self { limiter: Arc::clone(limiter), key_id, estimasi, aktif: AtomicBool::new(true) }
+    }
+
+    fn kembalikan(&self) {
+        if self.aktif.swap(false, Ordering::SeqCst) {
+            self.limiter.koreksi_token(self.key_id, -ke_i64(self.estimasi));
+        }
+    }
+
+    fn lepas(&self) {
+        self.aktif.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for JatahGuard {
+    fn drop(&mut self) {
+        self.kembalikan();
+    }
+}
+
 struct Konteks<'a> {
     s: &'a AppState,
     rt: &'a Arc<Runtime>,
@@ -197,14 +234,16 @@ struct Konteks<'a> {
     jejak: &'a Jejak,
     alias: &'a str,
     estimasi: u64,
+    jatah: JatahGuard,
+}
+
+fn respons_rusak() -> ApiError {
+    ApiError::new(StatusCode::BAD_GATEWAY, "api_error", "upstream_invalid_response", "Respons upstream bukan JSON yang valid.")
 }
 
 impl Konteks<'_> {
-    fn kembalikan_jatah(&self) {
-        self.s.limiter.koreksi_token(self.ident.key_id, -ke_i64(self.estimasi));
-    }
-
-    /// Satu kali parse untuk usage (statistik + koreksi TPM) dan guardrail respons. Isi bukan JSON diteruskan apa adanya.
+    /// Satu kali parse untuk usage (statistik + koreksi TPM) dan guardrail respons. Respons 2xx yang bukan JSON adalah upstream
+    /// rusak (mis. halaman portal dari `base_url` yang salah): dijawab 502 dan jatah dikembalikan, tidak pernah dianggap sukses.
     async fn proses_sukses(&self, isi: Bytes) -> Result<Bytes, ApiError> {
         let (besar, saring) = (isi.len() > AMBANG_BERAT, self.rt.guardrail.aktif_response());
         let (rt, salinan) = (Arc::clone(self.rt), isi.clone());
@@ -222,7 +261,11 @@ impl Konteks<'_> {
             Some((usage, lap, baru))
         })
         .await?;
-        let Some((usage, lap, baru)) = hasil else { return Ok(isi) };
+        let Some((usage, lap, baru)) = hasil else {
+            tracing::warn!(alias = %self.alias, key = %self.ident.nama, "respons upstream 2xx bukan JSON yang valid");
+            self.jatah.kembalikan();
+            return Err(respons_rusak());
+        };
 
         if let Some(u) = usage {
             if self.ident.tpm.is_some()
@@ -260,13 +303,38 @@ fn balasan(
 
 fn galat_upstream(g: Gagal, percobaan: u32) -> Result<Response, ApiError> {
     let (status, kode, pesan) = match g {
+        // 401/403 dari provider berarti key provider di gateway salah; isi galatnya (bisa memuat potongan key atau info akun)
+        // tidak boleh sampai ke klien.
+        Gagal::Http { status, .. } if matches!(status.as_u16(), 401 | 403) => {
+            tracing::error!(status = status.as_u16(), "provider menolak kredensial gateway; periksa key provider");
+            (
+                StatusCode::BAD_GATEWAY,
+                "upstream_auth_failed",
+                "Upstream menolak kredensial gateway (periksa key provider di sisi operator).",
+            )
+        }
         Gagal::Http { status, content_type, body, .. } => return balasan(status, content_type, None, percobaan, body),
         Gagal::Timeout => (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout", "Upstream melewati batas waktu."),
         Gagal::Sambung => (StatusCode::BAD_GATEWAY, "upstream_unreachable", "Upstream tidak dapat dihubungi."),
         Gagal::Terputus => (StatusCode::BAD_GATEWAY, "upstream_read_failed", "Respons upstream terputus."),
         Gagal::TerlaluBesar => (StatusCode::BAD_GATEWAY, "upstream_response_too_large", "Respons upstream melebihi batas ukuran."),
+        Gagal::ResponsRusak => return Err(respons_rusak()),
+        Gagal::Redirect => (StatusCode::BAD_GATEWAY, "upstream_redirect", "Upstream mengarahkan ulang request (periksa base_url)."),
     };
     Err(ApiError::new(status, "api_error", kode, pesan))
+}
+
+/// Parameter yang tidak boleh diteruskan: `stream` (gateway hanya melayani non-streaming, jadi upstream selalu non-streaming)
+/// dan kunci pengalih rute milik agregator seperti OpenRouter, yang bisa menimpa model/penyedia yang dipatok di config.
+const KUNCI_PENGALIH_RUTE: [&str; 5] = ["provider", "models", "route", "transforms", "plugins"];
+
+fn bersihkan_parameter(req: &mut Value) {
+    if let Some(o) = req.as_object_mut() {
+        o.remove("stream");
+        for k in KUNCI_PENGALIH_RUTE {
+            o.remove(k);
+        }
+    }
 }
 
 async fn chat_completions(
@@ -275,9 +343,18 @@ async fn chat_completions(
     Extension(jejak): Extension<Jejak>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    // Perkiraan kasar token masukan (~4 byte/token); dikoreksi dengan `usage` asli setelah respons.
+    let estimasi = (body.len() as u64 / 4).max(1);
+    // Tolak lebih awal bila key sudah melewati batas, TANPA memakai jatah dan sebelum parse/pemindaian yang mahal: request yang
+    // pasti ditolak tidak boleh memakan CPU sebesar request yang sukses.
+    s.limiter.periksa(ident.key_id, ident.rpm, ident.tpm, estimasi, Instant::now()).map_err(|t| {
+        tracing::info!(key = %ident.nama, batas = t.nama(), "request ditolak: rate limit (sebelum parse)");
+        ApiError::rate_limited(t)
+    })?;
+
     let besar = body.len() > AMBANG_BERAT;
     let mentah = body.clone();
-    let req: Value = berat(besar, move || serde_json::from_slice(&mentah))
+    let mut req: Value = berat(besar, move || serde_json::from_slice(&mentah))
         .await?
         .map_err(|_| ApiError::bad_request("invalid_json", "Body request bukan JSON yang valid."))?;
     let obj = req.as_object().ok_or_else(|| ApiError::bad_request("invalid_body", "Body request harus berupa objek JSON."))?;
@@ -286,7 +363,9 @@ async fn chat_completions(
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("missing_model", "Field 'model' wajib diisi (string)."))?
         .to_string();
-    if obj.get("stream").and_then(Value::as_bool) == Some(true) {
+    // Hanya `false`/`null`/tidak ada yang diterima. Nilai "truthy" lain ("true", 1, ...) bisa dibaca sebagai true oleh server
+    // upstream yang longgar, lalu balasan SSE-nya lolos tanpa pemindaian guardrail.
+    if !matches!(obj.get("stream"), None | Some(Value::Null) | Some(Value::Bool(false))) {
         return Err(ApiError::bad_request("stream_unsupported", "Streaming belum didukung gateway ini."));
     }
 
@@ -309,6 +388,7 @@ async fn chat_completions(
         ));
     }
 
+    bersihkan_parameter(&mut req);
     let (mut req, lap_req) = saring_request(&rt, req, besar).await?;
     if lap_req.total() > 0 {
         catat_temuan(&jejak, &lap_req, false);
@@ -318,29 +398,38 @@ async fn chat_completions(
         }
     }
 
-    // Perkiraan kasar token masukan (~4 byte/token); dikoreksi dengan `usage` asli setelah respons.
-    let estimasi = (body.len() as u64 / 4).max(1);
     s.limiter.coba(ident.key_id, ident.rpm, ident.tpm, estimasi, Instant::now()).map_err(|t| {
         tracing::info!(alias = %alias, key = %ident.nama, batas = t.nama(), "request ditolak: rate limit");
         ApiError::rate_limited(t)
     })?;
-    let ctx = Konteks { s: &s, rt: &rt, ident: &ident, jejak: &jejak, alias: &alias, estimasi };
+    let ctx = Konteks {
+        s: &s,
+        rt: &rt,
+        ident: &ident,
+        jejak: &jejak,
+        alias: &alias,
+        estimasi,
+        jatah: JatahGuard::baru(&s.limiter, ident.key_id, estimasi),
+    };
 
     let akhir = failover::jalankan(&s, &alias, &siap, &mut req, &ident.nama).await;
     kunci(&jejak.0).percobaan = akhir.percobaan;
 
     match akhir.hasil {
         Ok(b) if !b.status.is_success() => {
-            ctx.kembalikan_jatah();
+            ctx.jatah.kembalikan();
             balasan(b.status, b.content_type, Some(&b.upstream), akhir.percobaan, b.body)
         }
         Ok(b) => {
-            let isi = ctx.proses_sukses(b.body).await?;
+            let hasil = ctx.proses_sukses(b.body).await;
+            // `usage` asli sudah mengoreksi jatah (atau respons diblok setelah token terpakai): jangan dikembalikan lagi.
+            ctx.jatah.lepas();
+            let isi = hasil?;
             kunci(&jejak.0).upstream = Some(b.upstream.clone());
             balasan(b.status, b.content_type, Some(&b.upstream), akhir.percobaan, isi)
         }
         Err(g) => {
-            ctx.kembalikan_jatah();
+            ctx.jatah.kembalikan();
             galat_upstream(g, akhir.percobaan)
         }
     }

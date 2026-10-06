@@ -285,7 +285,7 @@ async fn setiap_request_chat_tercatat_dengan_rincian_yang_benar() {
     assert_eq!((b[2].1.clone(), b[2].3), (None, 404), "nama model sembarang tidak boleh masuk kolom alias");
     assert_eq!(
         (b[4].0.as_str(), b[4].1.as_deref(), b[4].4.as_str(), b[4].5.as_deref()),
-        ("tim-b", Some("m1"), "limit", Some("rate_limit_exceeded"))
+        ("tim-b", None, "limit", Some("rate_limit_exceeded"))
     );
 
     let (d, e) = semua_waktu();

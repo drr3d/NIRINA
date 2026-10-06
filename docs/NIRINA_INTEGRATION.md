@@ -278,7 +278,8 @@ NIRINA's router (`DynamicTokenRouterLLM`) tries the chain entries in order. For 
 | no response (connection refused, timeout) | the gateway is down | connection / timeout | next entry; breaker opens for 30 s |
 | `429 rate_limit_exceeded` (the key's limit) | policy: the key is over its limit | rate limit | next entry; breaker opens 30 s |
 | `403 guardrail_blocked` (secret in the prompt, `block` mode) | policy: do not send this | auth (401/403) | next entry; breaker opens **300 s** |
-| `502 guardrail_blocked` / `502 upstream_*` | the gateway blocked or exhausted its providers | server (5xx) | next entry |
+| `502 guardrail_blocked` / `502 upstream_*` (for example `upstream_invalid_response`, `upstream_redirect`) | the gateway blocked or exhausted its providers | server (5xx) | next entry |
+| `502 upstream_auth_failed` | the gateway's own provider key was rejected (operator problem) | server (5xx) | next entry |
 | `429` forwarded from a provider (for example OpenRouter free) | the provider is rate limiting | rate limit | next entry (this is the normal, desired failover) |
 
 The breaker defaults come from NIRINA's environment: `NIRINA_LLM_JEDA_PUTUS` (30 s), `NIRINA_LLM_JEDA_PUTUS_AUTH` (300 s), `NIRINA_LLM_GAGAL_BERUNTUN` (2 consecutive server or connection failures before opening; timeouts, rate limits and auth errors open it immediately).

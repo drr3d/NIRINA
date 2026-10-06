@@ -82,6 +82,19 @@ pub struct Limiter {
 }
 
 impl Limiter {
+    /// Memeriksa batas TANPA memakai jatah. Dipakai untuk menolak sedini mungkin, sebelum pekerjaan mahal (parse dan pemindaian
+    /// body): request yang pasti ditolak tidak boleh memakan CPU sebesar request yang sukses.
+    pub fn periksa(&self, key_id: i64, rpm: Option<u64>, tpm: Option<u64>, estimasi_token: u64, now: Instant) -> Result<(), Tolak> {
+        if rpm.is_none() && tpm.is_none() {
+            return Ok(());
+        }
+        // Key yang belum pernah tercatat punya bucket penuh, jadi pasti lolos.
+        match kunci(&self.state).get_mut(&key_id) {
+            Some(k) => cek(k, rpm, tpm, estimasi_token, now),
+            None => Ok(()),
+        }
+    }
+
     /// Memeriksa dan sekaligus memakai jatah. Kalau salah satu batas terlewati, tidak ada jatah yang terpakai.
     pub fn coba(&self, key_id: i64, rpm: Option<u64>, tpm: Option<u64>, estimasi_token: u64, now: Instant) -> Result<(), Tolak> {
         if rpm.is_none() && tpm.is_none() {
@@ -89,27 +102,12 @@ impl Limiter {
         }
         let mut peta = kunci(&self.state);
         let k = peta.entry(key_id).or_default();
-        sinkron(&mut k.rpm, rpm, now);
-        sinkron(&mut k.tpm, tpm, now);
-
-        if let Some(e) = &k.rpm
-            && e.token < 1.0
-        {
-            return Err(Tolak::Rpm { tunggu: e.tunggu_hingga(1.0) });
-        }
-        let estimasi = estimasi_token as f64;
-        if let Some(e) = &k.tpm {
-            // request yang lebih besar dari seluruh kapasitas tetap bisa lewat saat bucket penuh (lalu saldo negatif).
-            let butuh = estimasi.min(e.kapasitas);
-            if e.token < butuh {
-                return Err(Tolak::Tpm { tunggu: e.tunggu_hingga(butuh) });
-            }
-        }
+        cek(k, rpm, tpm, estimasi_token, now)?;
         if let Some(e) = &mut k.rpm {
             e.token -= 1.0;
         }
         if let Some(e) = &mut k.tpm {
-            e.token = (e.token - estimasi).max(-e.kapasitas * MAKS_UTANG_MENIT);
+            e.token = (e.token - estimasi_token as f64).max(-e.kapasitas * MAKS_UTANG_MENIT);
         }
         Ok(())
     }
@@ -120,6 +118,25 @@ impl Limiter {
             e.token = (e.token - selisih as f64).clamp(-e.kapasitas * MAKS_UTANG_MENIT, e.kapasitas);
         }
     }
+}
+
+/// Menyegarkan bucket sesuai batas saat ini lalu memeriksa apakah request lolos. Tidak memakai jatah.
+fn cek(k: &mut PerKey, rpm: Option<u64>, tpm: Option<u64>, estimasi_token: u64, now: Instant) -> Result<(), Tolak> {
+    sinkron(&mut k.rpm, rpm, now);
+    sinkron(&mut k.tpm, tpm, now);
+    if let Some(e) = &k.rpm
+        && e.token < 1.0
+    {
+        return Err(Tolak::Rpm { tunggu: e.tunggu_hingga(1.0) });
+    }
+    if let Some(e) = &k.tpm {
+        // request yang lebih besar dari seluruh kapasitas tetap bisa lewat saat bucket penuh (lalu saldo negatif).
+        let butuh = (estimasi_token as f64).min(e.kapasitas);
+        if e.token < butuh {
+            return Err(Tolak::Tpm { tunggu: e.tunggu_hingga(butuh) });
+        }
+    }
+    Ok(())
 }
 
 fn sinkron(slot: &mut Option<Ember>, batas: Option<u64>, now: Instant) {

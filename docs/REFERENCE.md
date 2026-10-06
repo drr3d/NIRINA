@@ -108,14 +108,14 @@ The order matters, because it decides what costs quota:
    - Bad JSON gives `400 invalid_json`.
    - A non-object body gives `400 invalid_body`.
    - A missing `model` gives `400 missing_model`.
-   - `"stream": true` (JSON boolean) gives `400 stream_unsupported`.
+   - Any `stream` value other than `false` or `null` (for example `true`, `"true"` or `1`) gives `400 stream_unsupported`. Strictness matters: a lenient upstream could read a string or a number as `true` and answer with a stream, which the response guardrail would not scan.
    - An unknown alias gives `404 model_not_found`.
    - Upstreams whose `api_key_env` is set but empty are skipped. If none remain, you get `503 upstream_not_configured`.
 3. **Request guardrail.** Secrets are redacted, or the request is rejected with `403 guardrail_blocked`. This runs before the limiter, so rejected requests spend no quota.
-4. **Rate limit.** The per-key RPM/TPM bucket is checked. A rejection gives `429 rate_limit_exceeded` plus `Retry-After`.
+4. **Rate limit.** The per-key RPM/TPM bucket is checked twice. The first check runs right after auth, **before the body is parsed or scanned**, and spends nothing, so a key that is already over its limit costs almost no CPU. The second check, just before the upstream call, spends the quota. A rejection gives `429 rate_limit_exceeded` plus `Retry-After`.
 5. **Failover.** The request is sent to the upstreams in order. `model` is overwritten with each upstream's real model name, and a `Bearer` header with the provider key is added if one is configured. Client headers are not forwarded, and the virtual key is never sent upstream.
 6. **Response guardrail and accounting.** For a successful JSON answer, nigate reads `usage`, corrects the TPM bucket, scans the completion, and then returns it.
-7. **Stats.** A metadata row is queued. This covers every request that passed auth on the chat route, including 400, 429 and 5xx results. 401s and `/v1/models` calls are not recorded.
+7. **Stats.** A metadata row is queued. This covers every request that passed auth on the chat route, including 400, 429 and 5xx results. 401s and `/v1/models` calls are not recorded. A request the client abandons (closes the connection or times out first) is recorded too, as status `499` with code `client_cancelled` and outcome `klien`, and its TPM estimate is refunded. A request refused by the early rate-limit check has no `alias` in its row, because the body was never parsed.
 
 Successful responses carry `x-nigate-upstream` (the upstream's `name`, never its URL) and `x-nigate-attempts` (number of upstream calls, including retries).
 
@@ -140,7 +140,8 @@ Successful responses carry `x-nigate-upstream` (the upstream's `name`, never its
 | 429 | `rate_limit_exceeded` | Per-key RPM/TPM exceeded, with `Retry-After` |
 | 502 | `guardrail_blocked` | Provider response blocked by a `block`-mode rule |
 | 504 | `upstream_timeout` | Upstream timed out |
-| 502 | `upstream_unreachable`, `upstream_read_failed`, `upstream_response_too_large` | Transport-level upstream failures |
+| 502 | `upstream_unreachable`, `upstream_read_failed`, `upstream_response_too_large`, `upstream_invalid_response`, `upstream_redirect` | Upstream failures: transport level, a 2xx answer that is not a JSON object, or a 3xx redirect (never followed) |
+| 502 | `upstream_auth_failed` | The provider rejected the gateway's own credentials (401/403). The provider's body is not forwarded |
 | 500 | `internal` | Unexpected internal error |
 | any | (provider's own body) | If every upstream fails with an HTTP status, the last provider status and body are forwarded verbatim. See [Failover and health](#failover-and-health) |
 
@@ -250,7 +251,7 @@ A trimmed walkthrough (placeholders only):
 ```toml
 [server]
 listen = "127.0.0.1:4000"      # data listener. Expose beyond loopback only deliberately
-max_body_mb = 10               # max request body
+max_body_mb = 4                # max request body (chat requests are KB-sized)
 
 [auth]
 required = true                # false = /v1/* open, no keys, no limits (local development only)
@@ -316,8 +317,8 @@ The shipped `nigate.example.toml` defines two aliases: `chat-main` (a cloud upst
 | Key | Default | Valid range | Reload |
 |---|---|---|---|
 | `server.listen` | `127.0.0.1:4000` | `host:port` | restart |
-| `server.max_body_mb` | `10` | 1 to 256 | restart |
-| `server.max_response_mb` | `32` | 1 to 256 | yes |
+| `server.max_body_mb` | `4` | 1 to 256 | restart |
+| `server.max_response_mb` | `8` | 1 to 256 | yes |
 | `server.shutdown_grace_secs` | `30` | 1 to 300 | restart (read once at startup; a reload accepts it but does not apply it, and does not report it) |
 | `auth.required` | `true` | bool | yes |
 | `storage.db_path` | `nigate.db` | non-empty | restart |
@@ -417,7 +418,7 @@ To a client, nigate is one more OpenAI-compatible endpoint. Any client or SDK th
 | Base URL | `http://<gateway-host>:4000/v1`. It must end in `/v1`, because clients append `/chat/completions`. Left at its default, a client talks to the provider and not to nigate |
 | API key | the `ngk_...` virtual key, sent as `Authorization: Bearer ngk_...` (the scheme is case-insensitive). Never use the provider's own key here |
 | `model` | the nigate **alias** from a `[[model]]` block, not the provider's model name. `GET /v1/models` lists the aliases |
-| `stream` | omit it or send `false`. `"stream": true` is rejected with `400 stream_unsupported` |
+| `stream` | omit it or send `false`. Any other value (`true`, `"true"`, `1`, ...) is rejected with `400 stream_unsupported` |
 | Timeout | larger than nigate's `total_timeout_secs` (300 by default), plus a little for guardrail processing. Otherwise the client gives up while nigate is still retrying or failing over |
 | Client-side retries | off (for example `max_retries=0`), so retries and failover are left to nigate. Otherwise the client's own retries stack on top of nigate's |
 | Other parameters | `temperature`, `max_tokens`, `tools` and the like are forwarded to the upstream. Only `model` is overwritten with the upstream's real model name |
@@ -465,12 +466,13 @@ Errors use the OpenAI-style envelope described in [Architecture and request path
 | `404` `model_not_found` | The `model` value is not an alias of this gateway | No, fix the alias |
 | `429` `rate_limit_exceeded` | The key's own RPM or TPM is exhausted. `Retry-After` gives the wait in whole seconds (1 to 3600) | Yes, after `Retry-After` |
 | `502` `guardrail_blocked` | A `block`-mode rule matched the provider's *response* (the provider was already billed) | Usually not: the same prompt tends to give the same result |
-| `502` `upstream_unreachable`, `upstream_read_failed`, `upstream_response_too_large`; `504` `upstream_timeout` | Every upstream tried failed at transport level. nigate has already retried and failed over within its budget | Yes, later, with backoff |
+| `502` `upstream_unreachable`, `upstream_read_failed`, `upstream_response_too_large`, `upstream_invalid_response`, `upstream_redirect`; `504` `upstream_timeout` | Every upstream tried failed at transport level. nigate has already retried and failed over within its budget | Yes, later, with backoff |
+| `502` `upstream_auth_failed` | The provider rejected the gateway's own credentials (a wrong or revoked provider key inside nigate). An operator problem; the provider's body is deliberately not forwarded | Not until the operator fixes it |
 | `503` `upstream_not_configured` | Every upstream of the alias lacks its provider key. This is an operator problem | Not until the operator fixes it |
 | `500` `internal` | Unexpected gateway error | Maybe once |
 | any status, provider's own body | See below | Depends on the status |
 
-**Provider statuses pass through.** If an upstream answers with a non-retryable error status (for example `400` or `422`), or if every upstream fails with an HTTP status, nigate forwards that provider status and body unchanged. A provider `401`, `403` or `429` can therefore reach the client without being nigate's own answer (a wrong provider key inside nigate shows up this way). A client that classifies failures by HTTP status alone can misread such a reply, so check whether the body carries one of nigate's `code` values (see the table in [Architecture and request path](#architecture-and-request-path)).
+**Provider statuses pass through.** If an upstream answers with a non-retryable error status (for example `400` or `422`), or if every upstream fails with an HTTP status, nigate forwards that provider status and body unchanged. A provider `429` can therefore reach the client without being nigate's own answer. A provider `401` or `403` does not: it becomes `502 upstream_auth_failed` with a generic message, because provider error bodies can carry a masked key or account details. A client that classifies failures by HTTP status alone can misread a forwarded `429`, so check whether the body carries one of nigate's `code` values (see the table in [Architecture and request path](#architecture-and-request-path)).
 
 **Response headers.**
 - `x-nigate-upstream`: the `name` of the upstream that produced the answer (never its URL). It is present on successful responses and on a non-retryable provider error that a specific upstream returned. It is absent on nigate's own JSON errors and when every upstream failed with an HTTP status.
@@ -550,7 +552,7 @@ It prints the findings per rule, which rules would block, and the text after red
 
 **Gaps to know (see also [Known limitations](#known-limitations)).**
 - Not scanned: tool and function *definitions*, `response_format`, `stop`, `metadata`, `user`, message `name`, non-`text` content parts (image URLs, audio, files), and a request with no `messages` key.
-- Response scanning covers only `choices[*].message` and `choices[*].text`. A non-JSON success body or a JSON body without `choices` passes unscanned. Non-2xx upstream bodies are forwarded without scanning.
+- Response scanning covers only `choices[*].message` and `choices[*].text`. A JSON body without `choices` passes unscanned. A 2xx body that is not a JSON object is not passed through at all: it is treated as an upstream failure (failover, or `502 upstream_invalid_response`). Non-2xx upstream bodies are forwarded without scanning.
 - `"stream": "true"` (a string) is not rejected, and a streamed reply would not be scanned.
 - It is a heuristic. Secrets without a known prefix, a label such as `password=`, or enough length and entropy can slip through.
 - The policy is global: no per-key or per-alias override.
@@ -565,6 +567,8 @@ The order of `[[model.upstream]]` entries is the priority order.
 |---|---|
 | Connection error, timeout, body read error, 5xx, 408 | Retry the same upstream (up to `max_retries`), then move to the next |
 | 429, 401, 403 | Move to the next upstream immediately (no retry) |
+| 3xx (redirect) | Move to the next upstream (no retry). Redirects are never followed, because following one would replay the prompt body at an address the upstream chose |
+| 2xx whose body is not a JSON object (a captive-portal or login page from a wrong `base_url`, an empty body) | Move to the next upstream (no retry) |
 | Response larger than `server.max_response_mb` | Move to the next upstream (no retry) |
 | Any other 4xx (400, 404, 422, ...) | Return it to the client as-is; counts as a healthy upstream |
 | 2xx | Return it (after the response guardrail) |
@@ -579,8 +583,9 @@ The order of `[[model.upstream]]` entries is the priority order.
 - **Health keys.** Health state is keyed by `base_url|model` and is shared by every alias that points at the same endpoint and model. State is in memory and per process; it resets on restart. See the current state with `GET /admin/upstreams` or the Upstream tab.
 - **`/healthz` is process liveness only.** It does not reflect provider or database state.
 - **What the client sees when everything fails.**
-  - If the last failure was an HTTP status from a provider (5xx, 401, 403, 408 or 429), that provider's status, content type and body are forwarded verbatim, with `x-nigate-attempts` but without `x-nigate-upstream`. The provider's `Retry-After` is not forwarded. A provider-side 401 or 429 therefore looks like nigate's own by status; the body tells them apart (nigate's carry codes such as `invalid_api_key` or `rate_limit_exceeded`).
-  - Other failures become `504 upstream_timeout`, `502 upstream_unreachable`, `502 upstream_read_failed` or `502 upstream_response_too_large`.
+  - If the last failure was an HTTP status from a provider (5xx, 408 or 429), that provider's status, content type and body are forwarded verbatim, with `x-nigate-attempts` but without `x-nigate-upstream`. The provider's `Retry-After` is not forwarded. A provider-side 429 therefore looks like nigate's own by status; the body tells them apart (nigate's carry codes such as `rate_limit_exceeded`). A last failure of 401 or 403 becomes `502 upstream_auth_failed` instead.
+  - Other failures become `504 upstream_timeout` (including a response body that stalls past the timeout), `502 upstream_unreachable`, `502 upstream_read_failed`, `502 upstream_response_too_large`, `502 upstream_invalid_response` or `502 upstream_redirect`.
+  - If the total budget runs out in the middle of an upstream's retries, that upstream is still marked failed and enters cooldown.
 - **Duplicates.** Retries and failover resend the complete request. There is no idempotency key, so a retry after a timeout can cause duplicate generation on the provider side (and duplicate billing).
 
 ---
@@ -623,7 +628,7 @@ curl -X POST  -H "$H" "$A/admin/reload"
 ```
 
 **Stats rows** contain: `kelompok` (the group label), `request`, `ok`, `klien`, `limit`, `guardrail`, `upstream`, `gateway` (outcome counts), `temuan` (guardrail findings), `token_masuk`, `token_keluar`, `latensi_rata_ms` and `latensi_maks_ms`. The response wraps them as `{"aktif","jam","per","dari_ms","sampai_ms","dibuang","baris": [...]}`. Notes on stats:
-- **Outcomes.** `hasil` values: `ok`, `klien` (client-side error), `limit`, `guardrail`, `upstream`, `gateway`. A 401, 403, 408 or 429 forwarded from a provider counts as `upstream`; a gateway-generated 429 counts as `limit`.
+- **Outcomes.** `hasil` values: `ok`, `klien` (client-side error), `limit`, `guardrail`, `upstream`, `gateway`. A 408 or 429 forwarded from a provider, and every `502 upstream_*` code, counts as `upstream`; a gateway-generated 429 counts as `limit`.
 - **Time and buckets.** Timestamps (`dari_ms`, `sampai_ms`) are milliseconds, while `created_at` on keys is Unix seconds. `hari` and `jam` buckets are UTC. Rows are bucketed by request start time.
 - **Token sums.** Token counts come from the provider's `usage` on 2xx JSON upstream responses, including ones nigate then blocks with `502 guardrail_blocked`. If a provider reports only `total_tokens`, the input and output columns stay empty.
 - **Query parsing.** Parameters are not percent-decoded, unknown parameters are ignored, and `per` is case-sensitive.
@@ -757,9 +762,9 @@ Use absolute database paths in the config. Restrict `nigate.env` and the SQLite 
   - Concurrent requests keep hitting a failing upstream until the first one finishes its retries and cooldown is recorded.
   - There is no backoff jitter.
   - Permanent 5xx errors (such as 501) are retried like transient ones.
-- **Request rewriting.** The request is parsed and re-serialised before forwarding (after redaction), so key order and number formatting can differ from the client's bytes. `model` is replaced. The TPM estimate uses the original body size.
+- **Request rewriting.** The request is parsed and re-serialised before forwarding (after redaction), so key order and number formatting can differ from the client's bytes. `model` is replaced, and the fields `stream`, `provider`, `models`, `route`, `transforms` and `plugins` are removed (`stream` because only non-streaming is served; the others are aggregator routing overrides, for example OpenRouter's, that could replace the model or provider pinned in the config). Other fields such as `n` and `max_tokens` are forwarded as sent, so cost caps on them are not enforced here. The TPM estimate uses the original body size.
 - **TPM is approximate.** It is estimated from body size and corrected only from the upstream's reported `usage`, and only for keys that have a TPM limit. A guardrail-blocked *response* is not refunded.
-- **Guardrail coverage.** See [Guardrail](#guardrail): unscanned fields, unscanned non-JSON or non-`choices` responses, no PII, heuristic entropy, position-based overlap resolution, and a global policy.
+- **Guardrail coverage.** See [Guardrail](#guardrail): unscanned fields, unscanned non-`choices` responses, no PII, heuristic entropy, position-based overlap resolution, and a global policy.
 - **Statistics are lossy by design.** The queue holds 20,000 records. When it is full or a write fails, records are dropped and only counted in memory (`statistik_dibuang`, reset on restart). `/admin/guardrail/events` is therefore not an audit log. Statistics are visible within about a second, not instantly. A deleted and recreated key name merges into the old name's history.
 - **Key id reuse.** `api_keys.id` is a plain `INTEGER PRIMARY KEY`, so SQLite may reuse an id after the newest key is deleted. The limiter is keyed by that id and never pruned, so a recreated key could inherit an old bucket until restart. Prefer revoking over deleting.
 - **Admin mutations are not transactional.** Creating a key with limits is two steps, and `PATCH` is read-then-write. Concurrent edits can overwrite each other.
@@ -809,7 +814,7 @@ Source layout (`src/`; module names are Indonesian where noted):
 | `401 missing_api_key` | No `Authorization: Bearer ngk_...` header |
 | `401 invalid_api_key` | Key mistyped, revoked, or created in a different key store (check `storage.db_path`). CLI changes can take up to about 2 s |
 | `401`, `403` or `429` with a body that is not nigate's format | It came from the *provider*, forwarded as-is. Check the provider key and quota, and `GET /admin/upstreams` |
-| `400 stream_unsupported` | The client sent `"stream": true`. Disable streaming in the client |
+| `400 stream_unsupported` | The client sent `stream` with a value other than `false`/`null` (`true`, `"true"`, `1`, ...). Disable streaming in the client |
 | `404 model_not_found` | `model` is not an alias in `nigate.toml` |
 | `503 upstream_not_configured` | Every upstream of that alias has an `api_key_env` whose variable is empty in nigate's environment |
 | `429 rate_limit_exceeded` | The key's RPM or TPM is exhausted. See `Retry-After`, and raise the limit with `key limit` |
@@ -817,7 +822,10 @@ Source layout (`src/`; module names are Indonesian where noted):
 | `502 guardrail_blocked` | A `block`-mode rule matched the provider's *response* (the provider was already billed) |
 | `502 upstream_unreachable` | Wrong `base_url`, provider down, no network or DNS, or the address is not reachable from where nigate runs |
 | `504 upstream_timeout` | Upstream slower than its `timeout_secs`, or the total budget ran out |
-| `502 upstream_read_failed` | The connection broke while reading the body. A slow body that exceeds the timeout may also surface this way |
+| `502 upstream_read_failed` | The connection broke while reading the body |
+| `502 upstream_invalid_response` | A 2xx answer was not a JSON object. Often a captive-portal or login page because `base_url` is wrong |
+| `502 upstream_redirect` | The upstream answered 3xx and nigate does not follow redirects. Fix `base_url` (commonly `http` vs `https`, or a missing `/v1`) |
+| `502 upstream_auth_failed` | The provider rejected the gateway's key (401/403). Check the provider key variable in nigate's environment |
 | `502 upstream_response_too_large` | The response exceeded `server.max_response_mb` |
 | Admin API unreachable, log says `API admin TIDAK dijalankan` | The env var for the admin token is empty. Export it and restart |
 | Startup, reload or any CLI command fails mentioning the admin token being too short | The env var named by `admin.token_env` is set but under 24 characters. Generate a proper token |

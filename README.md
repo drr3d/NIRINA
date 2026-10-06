@@ -73,7 +73,7 @@ To a client, nigate is one more OpenAI-compatible endpoint. Nothing nigate-speci
 | Base URL | `http://<gateway-host>:4000/v1` (must end in `/v1`) |
 | API key | the `ngk_...` virtual key. Never the provider's own key |
 | `model` | a nigate **alias** from a `[[model]]` block (`GET /v1/models` lists them) |
-| `stream` | omit it or `false`. `true` is rejected with `400 stream_unsupported` |
+| `stream` | omit it or `false`. Any other value is rejected with `400 stream_unsupported` |
 | Timeout | larger than nigate's `total_timeout_secs` (300 by default) |
 | Client retries | off (`max_retries=0`): retries and failover are nigate's job |
 

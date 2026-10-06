@@ -242,10 +242,10 @@ fn default_listen() -> String {
     "127.0.0.1:4000".into()
 }
 fn default_max_body_mb() -> usize {
-    10
+    4
 }
 fn default_max_response_mb() -> usize {
-    32
+    8
 }
 fn default_shutdown_grace_secs() -> u64 {
     30

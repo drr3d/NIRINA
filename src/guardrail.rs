@@ -81,7 +81,13 @@ type Filter = fn(&str) -> bool;
 
 /// (nama, pola, filter). Bila pola punya grup tangkap, hanya grup 1 yang diganti (mis. nilai setelah `password=`).
 const BAWAAN: &[(&str, &str, Option<Filter>)] = &[
-    ("private_key", r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----(?:.*?-----END [A-Z ]*PRIVATE KEY-----|[A-Za-z0-9+/=\r\n ]{20,})", None),
+    // Tanpa `.*?` malas: pola lama membuat tiap penanda BEGIN tanpa END memindai sampai akhir teks (kuadratik: 1,3 MB = 17 detik).
+    // Isi dibatasi ke karakter PEM; deretan 5 tanda hubung (awal "-----END") menghentikannya, lalu END diambil bila ada.
+    (
+        "private_key",
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[A-Za-z0-9+/=\s:,.\\]|-{1,4}[A-Za-z0-9+/=\s:,.\\])*(?:-----END [A-Z ]*PRIVATE KEY-----)?",
+        Some(pem_cukup),
+    ),
     ("aws_access_key", r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[0-9A-Z]{16}\b", None),
     ("aws_secret_key", r#"(?i)aws.{0,20}?secret.{0,20}?[=:]\s*["']?([A-Za-z0-9/+=]{40})\b"#, None),
     ("github_token", r"\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})\b", None),
@@ -101,6 +107,12 @@ const BAWAAN: &[(&str, &str, Option<Filter>)] = &[
         Some(nilai_wajar),
     ),
 ];
+
+/// Header PEM saja (mis. disebut dalam teks penjelasan) bukan kunci: wajib ada isi minimal 20 karakter sesudah header.
+fn pem_cukup(v: &str) -> bool {
+    const PENUTUP: &str = "PRIVATE KEY-----";
+    v.find(PENUTUP).is_some_and(|i| v.len() - (i + PENUTUP.len()) >= 20)
+}
 
 /// Token yang tampak seperti kredensial: memuat huruf dan angka.
 fn token_campuran(v: &str) -> bool {
@@ -251,9 +263,20 @@ impl Guardrail {
         }
         if let Some(e) = &self.entropi {
             // Aturan spesifik lebih informatif (nama jelas, cakupan tepat): entropi hanya untuk bagian yang belum tertangkap.
-            let spesifik = temu.len();
+            // Disapu dengan indeks, bukan membandingkan tiap kandidat dengan semua temuan spesifik (kuadratik: 10 MB dengan
+            // 250 ribu temuan = 16 detik): urutkan span menurut awal, simpan akhir-terjauh kumulatif, lalu satu pencarian biner
+            // per kandidat. Kandidat tumpang tindih bila ada span yang mulai sebelum `t` dan berakhir setelah `s`.
+            let mut span: Vec<(usize, usize)> = temu.iter().map(|&(a, b, _)| (a, b)).collect();
+            span.sort_unstable();
+            let mut akhir_terjauh = Vec::with_capacity(span.len());
+            let mut maks = 0usize;
+            for &(_, b) in &span {
+                maks = maks.max(b);
+                akhir_terjauh.push(maks);
+            }
             for (s, t) in token_entropi_tinggi(teks, e.min_panjang, e.ambang) {
-                if !temu[..spesifik].iter().any(|&(a, b, _)| s < b && t > a) {
+                let k = span.partition_point(|&(a, _)| a < t);
+                if !(k > 0 && akhir_terjauh[k - 1] > s) {
                     temu.push((s, t, SENTINEL_ENTROPI));
                 }
             }

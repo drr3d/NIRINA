@@ -1,6 +1,8 @@
 # build
 target/
 
+/deploy-gcp/
+
 # konfigurasi lokal dan rahasia (jangan pernah di-commit)
 nigate.toml
 .env

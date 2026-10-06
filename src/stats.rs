@@ -153,12 +153,14 @@ pub struct Statistik {
     tx: Option<SyncSender<Pesan>>,
     thread: Mutex<Option<JoinHandle<()>>>,
     dibuang: Arc<AtomicU64>,
+    /// Berapa kali pekerja berputar (untuk memastikan ia tidak berputar sia-sia saat idle).
+    siklus: Arc<AtomicU64>,
     path: Option<String>,
 }
 
 impl Statistik {
     pub fn nonaktif() -> Self {
-        Self { tx: None, thread: Mutex::new(None), dibuang: Arc::default(), path: None }
+        Self { tx: None, thread: Mutex::new(None), dibuang: Arc::default(), siklus: Arc::default(), path: None }
     }
 
     /// Membuka (dan membuat) database statistik, membersihkan data yang lewat masa retensi, lalu menjalankan pekerja.
@@ -177,11 +179,13 @@ impl Statistik {
         let (tx, rx) = mpsc::sync_channel::<Pesan>(KAPASITAS_ANTRIAN);
         let dibuang = Arc::new(AtomicU64::new(0));
         let dibuang2 = dibuang.clone();
+        let siklus = Arc::new(AtomicU64::new(0));
+        let siklus2 = siklus.clone();
         let handle = std::thread::Builder::new()
             .name("nigate-stats".into())
-            .spawn(move || pekerja(conn, rx, retensi_hari, dibuang2))
+            .spawn(move || pekerja(conn, rx, retensi_hari, dibuang2, siklus2))
             .context("gagal menjalankan thread statistik")?;
-        Ok(Self { tx: Some(tx), thread: Mutex::new(Some(handle)), dibuang, path: Some(path.to_string()) })
+        Ok(Self { tx: Some(tx), thread: Mutex::new(Some(handle)), dibuang, siklus, path: Some(path.to_string()) })
     }
 
     pub fn catat(&self, r: Rekaman) {
@@ -193,12 +197,19 @@ impl Statistik {
                     tracing::warn!("antrian statistik penuh: rekaman dibuang (disk lambat?)");
                 }
             }
-            Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                // Pekerja sudah berhenti (setelah tutup atau panik): rekaman tidak bisa ditulis, tapi tidak boleh hilang diam-diam.
+                self.dibuang.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
     pub fn jumlah_dibuang(&self) -> u64 {
         self.dibuang.load(Ordering::Relaxed)
+    }
+
+    pub fn jumlah_siklus_pekerja(&self) -> u64 {
+        self.siklus.load(Ordering::Relaxed)
     }
 
     /// Menulis semua rekaman yang tersisa lalu menghentikan pekerja. Aman dipanggil berulang.
@@ -233,27 +244,36 @@ impl Drop for Statistik {
     }
 }
 
-fn pekerja(mut conn: Connection, rx: mpsc::Receiver<Pesan>, retensi_hari: u32, dibuang: Arc<AtomicU64>) {
+fn pekerja(mut conn: Connection, rx: mpsc::Receiver<Pesan>, retensi_hari: u32, dibuang: Arc<AtomicU64>, siklus: Arc<AtomicU64>) {
     let mut buf: Vec<Rekaman> = Vec::with_capacity(UKURAN_BATCH);
-    let mut terakhir_flush = Instant::now();
+    // Kapan rekaman pertama batch ini masuk. None = idle: menunggu tanpa polling sampai ada rekaman (atau saatnya purge).
+    let mut awal_batch: Option<Instant> = None;
     let mut terakhir_purge = Instant::now();
     loop {
-        let tunggu = JEDA_FLUSH.saturating_sub(terakhir_flush.elapsed()).max(Duration::from_millis(10));
+        siklus.fetch_add(1, Ordering::Relaxed);
+        let tunggu = match awal_batch {
+            Some(t) => JEDA_FLUSH.saturating_sub(t.elapsed()),
+            None => JEDA_PURGE.saturating_sub(terakhir_purge.elapsed()),
+        };
         let selesai = match rx.recv_timeout(tunggu) {
             Ok(Pesan::Rekam(r)) => {
+                if buf.is_empty() {
+                    awal_batch = Some(Instant::now());
+                }
                 buf.push(*r);
                 false
             }
             Ok(Pesan::Tutup) | Err(RecvTimeoutError::Disconnected) => true,
             Err(RecvTimeoutError::Timeout) => false,
         };
-        if selesai || buf.len() >= UKURAN_BATCH || (!buf.is_empty() && terakhir_flush.elapsed() >= JEDA_FLUSH) {
+        let jatuh_tempo = awal_batch.is_some_and(|t| t.elapsed() >= JEDA_FLUSH);
+        if selesai || buf.len() >= UKURAN_BATCH || jatuh_tempo {
             if let Err(e) = tulis(&mut conn, &buf) {
                 tracing::warn!("gagal menulis {} rekaman statistik: {e:#}", buf.len());
                 dibuang.fetch_add(buf.len() as u64, Ordering::Relaxed);
             }
             buf.clear();
-            terakhir_flush = Instant::now();
+            awal_batch = None;
         }
         if selesai {
             return;
@@ -440,37 +460,63 @@ pub fn sekarang_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-/// Middleware untuk /v1/chat/completions: mengukur latensi dan menitipkan satu rekaman per request
-/// (termasuk yang ditolak rate limit atau gagal validasi). Tidak pernah membaca isi body.
+/// Menitipkan rekaman bila request berhenti sebelum selesai (klien menutup koneksi atau menyerah karena timeout): handler
+/// dibatalkan di tengah `await` dan kode sesudah `next.run` tidak pernah berjalan, jadi pencatatan dilakukan dari `Drop`.
+struct PencatatRequest {
+    statistik: Arc<Statistik>,
+    ident: Option<Identitas>,
+    jejak: Jejak,
+    ts_ms: i64,
+    mulai: Instant,
+    aktif: bool,
+}
+
+impl PencatatRequest {
+    fn catat(&mut self, status: u16, kode: Option<&'static str>) {
+        self.aktif = false;
+        let d = kunci(&self.jejak.0);
+        let (key_id, key_name) = self.ident.as_ref().map(|i| (i.key_id, i.nama.clone())).unwrap_or((0, "anonim".into()));
+        self.statistik.catat(Rekaman {
+            ts_ms: self.ts_ms,
+            key_id,
+            key_name,
+            alias: d.alias.clone(),
+            upstream: d.upstream.clone(),
+            status,
+            hasil: klasifikasi(status, kode),
+            kode_galat: kode.map(String::from),
+            token_masuk: d.token_masuk,
+            token_keluar: d.token_keluar,
+            latensi_ms: self.mulai.elapsed().as_millis() as u64,
+            percobaan: d.percobaan,
+            temuan_masuk: d.temuan_masuk,
+            temuan_keluar: d.temuan_keluar,
+            jenis_temuan: (!d.jenis_temuan.is_empty()).then(|| d.jenis_temuan.iter().cloned().collect::<Vec<_>>().join(",")),
+        });
+    }
+}
+
+impl Drop for PencatatRequest {
+    fn drop(&mut self) {
+        if self.aktif {
+            // 499 = klien menutup koneksi sebelum jawaban jadi.
+            self.catat(499, Some("client_cancelled"));
+        }
+    }
+}
+
+/// Middleware untuk /v1/chat/completions: mengukur latensi dan menitipkan satu rekaman per request (termasuk yang ditolak
+/// rate limit, gagal validasi, atau dibatalkan klien). Tidak pernah membaca isi body.
 pub async fn catat_statistik(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
-    let mulai = Instant::now();
-    let ts_ms = sekarang_ms();
     let ident = req.extensions().get::<Identitas>().cloned();
     let jejak = Jejak::default();
     req.extensions_mut().insert(jejak.clone());
+    let mut pencatat =
+        PencatatRequest { statistik: s.statistik.clone(), ident, jejak, ts_ms: sekarang_ms(), mulai: Instant::now(), aktif: true };
 
     let resp = next.run(req).await;
 
-    let status = resp.status().as_u16();
     let kode = resp.extensions().get::<KodeGalat>().map(|k| k.0);
-    let d = kunci(&jejak.0);
-    let (key_id, key_name) = ident.map(|i| (i.key_id, i.nama)).unwrap_or((0, "anonim".into()));
-    s.statistik.catat(Rekaman {
-        ts_ms,
-        key_id,
-        key_name,
-        alias: d.alias.clone(),
-        upstream: d.upstream.clone(),
-        status,
-        hasil: klasifikasi(status, kode),
-        kode_galat: kode.map(String::from),
-        token_masuk: d.token_masuk,
-        token_keluar: d.token_keluar,
-        latensi_ms: mulai.elapsed().as_millis() as u64,
-        percobaan: d.percobaan,
-        temuan_masuk: d.temuan_masuk,
-        temuan_keluar: d.temuan_keluar,
-        jenis_temuan: (!d.jenis_temuan.is_empty()).then(|| d.jenis_temuan.iter().cloned().collect::<Vec<_>>().join(",")),
-    });
+    pencatat.catat(resp.status().as_u16(), kode);
     resp
 }
