@@ -317,9 +317,14 @@ pub struct Upstream {
 }
 
 impl Config {
+    /// Nilai env (key provider, token admin) dari Pengaturan platform bila ada, lalu dari env proses.
     pub fn from_file(path: &str) -> Result<Self> {
+        Self::from_file_dengan(path, &crate::platform::SumberPlatform::dari_env().pencari())
+    }
+
+    pub fn from_file_dengan(path: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
         let teks = std::fs::read_to_string(path).with_context(|| format!("tidak bisa membaca config {path}"))?;
-        Self::from_toml_str(&teks, &|nama| std::env::var(nama).ok())
+        Self::from_toml_str(&teks, env)
     }
 
     /// `env` disuntik supaya bisa diuji tanpa menyentuh environment proses.
@@ -450,7 +455,10 @@ impl Config {
         };
         let admin_token = env(f.admin.token_env.trim()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
         if admin_token.as_deref().is_some_and(|t| t.len() < 24) {
-            bail!("token admin di env {} terlalu pendek (minimal 24 karakter); buat dengan: nigate admin token", f.admin.token_env.trim());
+            bail!(
+                "token admin {} terlalu pendek (minimal 24 karakter; dari env atau Pengaturan platform); buat dengan: nigate admin token",
+                f.admin.token_env.trim()
+            );
         }
         Guardrail::baru(&guardrail)?; // validasi lebih awal: pola regex salah / nama aturan typo menggagalkan startup
         Ok(Config {

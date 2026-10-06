@@ -114,6 +114,7 @@ Tabs (labels are Indonesian): *Ringkasan* (summary), *Key & Limit*, *Upstream*, 
 | Review the security model | [Reference: Security notes](docs/REFERENCE.md#security-notes) |
 | Fix a problem | [Reference: Troubleshooting](docs/REFERENCE.md#troubleshooting) |
 | Connect NIRINA | [NIRINA integration](docs/NIRINA_INTEGRATION.md) |
+| Run it as a team of a setup platform (settings form, dashboard behind the platform login) | [Running under the platform](docs/PLATFORM.md) |
 
 ## Good to know before you rely on it
 

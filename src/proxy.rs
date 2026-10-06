@@ -26,6 +26,7 @@ use crate::{
     kesehatan::Kesehatan,
     keys::KeyStore,
     limiter::Limiter,
+    platform::SumberPlatform,
     stats::{Jejak, Statistik, catat_statistik},
     util::{baca, ke_i64, kunci, tulis},
 };
@@ -47,6 +48,8 @@ pub struct AppState {
     pub statistik: Arc<Statistik>,
     /// Lokasi file config untuk reload (None = reload tidak tersedia).
     pub config_path: Option<Arc<str>>,
+    /// Sumber setting platform yang dipakai saat config dimuat ulang.
+    pub platform: Arc<SumberPlatform>,
     pub mulai: Instant,
 }
 
@@ -70,6 +73,7 @@ impl AppState {
             kesehatan: Arc::default(),
             statistik: Arc::new(Statistik::nonaktif()),
             config_path: None,
+            platform: Arc::new(SumberPlatform::dari_env()),
             mulai: Instant::now(),
         })
     }
@@ -88,6 +92,11 @@ impl AppState {
 
     pub fn dengan_config_path(mut self, path: &str) -> Self {
         self.config_path = Some(Arc::from(path));
+        self
+    }
+
+    pub fn dengan_platform(mut self, platform: Arc<SumberPlatform>) -> Self {
+        self.platform = platform;
         self
     }
 

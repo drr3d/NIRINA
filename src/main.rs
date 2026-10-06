@@ -8,6 +8,7 @@ use nigate::{
     config::Config,
     guardrail::{Guardrail, Laporan},
     keys::KeyStore,
+    platform::{self, SumberPlatform},
     stats::{Baris, Kelompok, Statistik, ringkasan_dari_file, sekarang_ms},
 };
 use tracing_subscriber::EnvFilter;
@@ -29,10 +30,14 @@ Config: --config/-c, atau env NIGATE_CONFIG, atau ./nigate.toml.";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .init();
+    let sumber = Arc::new(SumberPlatform::dari_env());
+    // Level log: setting RUST_LOG di platform, lalu env RUST_LOG, lalu "info". Dibaca diam-diam karena logger belum ada.
+    let log_platform = sumber.baca().ok().flatten().and_then(|s| s.get("RUST_LOG").map(|v| v.trim().to_string())).filter(|v| !v.is_empty());
+    let filter = log_platform
+        .and_then(|v| EnvFilter::try_new(v).ok())
+        .or_else(|| EnvFilter::try_from_default_env().ok())
+        .unwrap_or_else(|| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(filter).init();
 
     let (path, perintah) = baca_argumen();
     let perintah: Vec<&str> = perintah.iter().map(String::as_str).collect();
@@ -48,10 +53,10 @@ async fn main() -> Result<()> {
         println!("Token admin baru (simpan; set sebagai env NIGATE_ADMIN_TOKEN untuk gateway dan untuk UI):\n\n  {token}\n");
         return Ok(());
     }
-    let cfg = Config::from_file(&path)?;
+    let cfg = Config::from_file_dengan(&path, &sumber.pencari())?;
 
     match perintah.as_slice() {
-        [] | ["serve"] => serve(cfg, &path).await,
+        [] | ["serve"] => serve(cfg, &path, sumber).await,
         ["key", aksi, rest @ ..] => perintah_key(&cfg, aksi, rest),
         ["stats", flags @ ..] => perintah_stats(&cfg, flags),
         ["healthcheck"] => healthcheck(&cfg).await,
@@ -241,12 +246,19 @@ fn tampil_batas(v: Option<u64>) -> String {
     v.map_or("-".into(), |x| x.to_string())
 }
 
-async fn serve(cfg: Config, path: &str) -> Result<()> {
+async fn serve(cfg: Config, path: &str, sumber: Arc<SumberPlatform>) -> Result<()> {
     let listen = cfg.listen.clone();
     let keys = Arc::new(KeyStore::open(&cfg.db_path)?);
     keys.pantau_perubahan(Duration::from_secs(2));
 
     tracing::info!(config = %path, model = cfg.models.len(), db = %cfg.db_path, "nigate mulai");
+    match sumber.baca() {
+        Ok(Some(s)) => {
+            tracing::info!(file = %sumber.path().display(), setting = s.len(), "config platform ditemukan; setting platform dipakai")
+        }
+        Ok(None) => tracing::info!(file = %sumber.path().display(), "config platform tidak ada; nilai dari env"),
+        Err(e) => tracing::error!("{e:#}; nilai dari env"),
+    }
     if !cfg.auth_required {
         tracing::warn!("auth.required = false: /v1/* TERBUKA tanpa API key. Hanya untuk pengembangan lokal.");
     } else if keys.list()?.iter().all(|k| !k.active) {
@@ -255,7 +267,7 @@ async fn serve(cfg: Config, path: &str) -> Result<()> {
     for (alias, m) in &cfg.models {
         for u in &m.upstreams {
             if let (Some(env), None) = (&u.key_env, &u.api_key) {
-                tracing::warn!("model '{alias}': env {env} kosong, request ke model ini akan dijawab 503");
+                tracing::warn!("model '{alias}': {env} kosong (env / Pengaturan platform), request ke model ini akan dijawab 503");
             }
         }
     }
@@ -274,7 +286,9 @@ async fn serve(cfg: Config, path: &str) -> Result<()> {
     let admin_listener = if !cfg.admin_enabled {
         None
     } else if cfg.admin_token.is_none() {
-        tracing::warn!("API admin TIDAK dijalankan: env token admin kosong. Buat token: nigate admin token, lalu set NIGATE_ADMIN_TOKEN.");
+        tracing::warn!(
+            "API admin TIDAK dijalankan: token admin kosong. Buat token: nigate admin token, lalu isi NIGATE_ADMIN_TOKEN (env atau Pengaturan platform) dan restart."
+        );
         None
     } else {
         let l = tokio::net::TcpListener::bind(&cfg.admin_listen)
@@ -290,7 +304,9 @@ async fn serve(cfg: Config, path: &str) -> Result<()> {
         Some(l)
     };
 
-    let state = AppState::new(cfg, keys)?.dengan_statistik(statistik.clone()).dengan_config_path(path);
+    let state = AppState::new(cfg, keys)?.dengan_statistik(statistik.clone()).dengan_config_path(path).dengan_platform(sumber);
+    // Perubahan Pengaturan di platform (key provider, dst.) diterapkan tanpa restart.
+    let _pantau = platform::pantau(state.clone(), Duration::from_secs(5));
 
     let (henti_tx, henti_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {

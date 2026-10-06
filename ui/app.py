@@ -2,6 +2,8 @@
 
 Jalankan:  python -m streamlit run app.py --server.port 8502     (atau ui\\jalankan.cmd di Windows)
 Env:       NIGATE_ADMIN_URL (bawaan http://127.0.0.1:4001), NIGATE_ADMIN_TOKEN
+Platform:  bila /platform/config.json ada (env NIGATE_PLATFORM_CONFIG), halaman hanya melayani request lewat login platform
+           (header X-Platform-Proxy-Token) dan token admin diambil dari Pengaturan platform; lihat platform_cfg.py.
 Halaman ini tidak membaca file database gateway; semua data lewat API admin.
 """
 
@@ -14,6 +16,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd())
 import klien  # noqa: E402
+import platform_cfg  # noqa: E402
 from klien import GalatGateway, TidakTerjangkau, TokenDitolak  # noqa: E402
 
 st.set_page_config(page_title="nigate", page_icon=None, layout="wide")
@@ -334,15 +337,45 @@ def tab_konfigurasi(c: klien.KlienAdmin, health: dict):
 
 # ---------- halaman ----------
 
+def koneksi_platform(cfg: dict):
+    """(url, token) di bawah platform, atau None bila halaman tidak boleh/bisa dilanjutkan (pesannya sudah ditampilkan)."""
+    if not platform_cfg.proxy_token(cfg):
+        st.error("Dashboard belum terhubung ke platform: token proxy belum ada. Buka tim nigate di halaman setup platform sekali, "
+                 "lalu tunggu sekitar 10 detik.")
+        return None
+    if not platform_cfg.header_sah(platform_cfg.header_proxy(), cfg):
+        st.error("Akses ditolak. Buka dashboard ini lewat halaman platform (menu tim nigate).")
+        return None
+    st.sidebar.caption("Terhubung lewat platform. Token admin diambil dari Pengaturan platform.")
+    url = os.environ.get("NIGATE_ADMIN_URL", "").strip() or platform_cfg.URL_ADMIN_PLATFORM
+    token = platform_cfg.token_admin(cfg) or os.environ.get("NIGATE_ADMIN_TOKEN", "").strip()
+    if not token:
+        st.title("nigate")
+        st.info("Token admin belum diisi. Isi NIGATE_ADMIN_TOKEN di Pengaturan tim nigate di platform, lalu Restart gateway di tab Service.")
+        return None
+    return url, token
+
+
 def main():
     st.sidebar.title("nigate")
     st.sidebar.caption("AI gateway untuk NIRINA")
-    url = st.sidebar.text_input("Alamat API admin", value=os.environ.get("NIGATE_ADMIN_URL", "http://127.0.0.1:4001"))
-    token = os.environ.get("NIGATE_ADMIN_TOKEN", "").strip()
-    if token:
-        st.sidebar.caption("Token admin dibaca dari environment.")
+    try:
+        cfg_platform = platform_cfg.baca()
+    except platform_cfg.ConfigRusak as e:
+        st.error(f"{e} Simpan ulang Pengaturan tim nigate di platform.")
+        return
+    if cfg_platform is not None:
+        hasil = koneksi_platform(cfg_platform)
+        if hasil is None:
+            return
+        url, token = hasil
     else:
-        token = st.sidebar.text_input("Token admin", type="password", help="Buat dengan: nigate admin token").strip()
+        url = st.sidebar.text_input("Alamat API admin", value=os.environ.get("NIGATE_ADMIN_URL", "http://127.0.0.1:4001"))
+        token = os.environ.get("NIGATE_ADMIN_TOKEN", "").strip()
+        if token:
+            st.sidebar.caption("Token admin dibaca dari environment.")
+        else:
+            token = st.sidebar.text_input("Token admin", type="password", help="Buat dengan: nigate admin token").strip()
     label = st.sidebar.selectbox("Periode", list(PERIODE), index=2)
     otomatis = st.sidebar.toggle("Segarkan otomatis (10 dtk)", value=False)
     st.sidebar.button("Segarkan sekarang")

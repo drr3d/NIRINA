@@ -364,7 +364,8 @@ The shipped `nigate.example.toml` defines two aliases: `chat-main` (a cloud upst
 | `NIGATE_ADMIN_TOKEN` | gateway, dashboard | Admin token (at least 24 chars). The variable name can be changed with `admin.token_env` |
 | `<your api_key_env names>` | gateway | One variable per upstream key, for example `CEREBRAS_API_KEY` in the shipped example or `PROVIDER_A_API_KEY` in the walkthrough above |
 | `RUST_LOG` | gateway, CLI | Log filter (tracing `EnvFilter` syntax, default `info`, written to stderr) |
-| `NIGATE_ADMIN_URL` | dashboard | Admin API address (default `http://127.0.0.1:4001`) |
+| `NIGATE_ADMIN_URL` | dashboard | Admin API address (default `http://127.0.0.1:4001`; `http://nigate-gateway:4001` under the platform) |
+| `NIGATE_PLATFORM_CONFIG` | gateway, CLI, dashboard | Platform config file (default `/platform/config.json`). When it exists, its non-empty settings win over the variables above (provider keys, admin token, `RUST_LOG`), and the dashboard requires the platform proxy header. See [Running under the platform](PLATFORM.md) |
 
 ---
 
@@ -652,6 +653,8 @@ python -m streamlit run app.py --server.port 8502 --server.address 127.0.0.1
 ```
 
 On Windows, `ui\jalankan.cmd` runs the same command, bound to `127.0.0.1:8502`, after you `set NIGATE_ADMIN_TOKEN=...`. If the token variable is not set, the sidebar shows a password field instead.
+
+Under a setup platform the dashboard is served behind the platform login, takes the admin token from the platform settings, and refuses requests without the platform proxy header; see [Running under the platform](PLATFORM.md).
 
 **Sidebar.** Admin API address, token, period (1 hour, 6 hours, 24 hours by default, 7 days, 30 days) and an optional 10-second auto-refresh (off by default). It also shows the gateway version and uptime and warns when stats are disabled or records were dropped.
 

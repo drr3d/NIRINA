@@ -7,6 +7,7 @@ pub mod guardrail;
 pub mod kesehatan;
 pub mod keys;
 pub mod limiter;
+pub mod platform;
 pub mod proxy;
 pub mod stats;
 pub mod util;

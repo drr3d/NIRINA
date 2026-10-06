@@ -357,18 +357,27 @@ async fn config_efektif(State(s): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// Membaca ulang file config (dengan setting platform terkini) dan menerapkannya. Config tidak valid ditolak seluruhnya;
+/// mengembalikan jumlah model dan bagian yang baru berlaku setelah restart. Dipakai API admin dan pemantau platform.
+pub fn muat_ulang_config(s: &AppState) -> anyhow::Result<(usize, Vec<&'static str>)> {
+    let path = s.config_path.clone().ok_or_else(|| anyhow::anyhow!("gateway tidak dijalankan dari file config"))?;
+    let baru = Config::from_file_dengan(&path, &s.platform.pencari())?;
+    let (efektif, perlu_restart) = s.runtime().config.gabung_hot(baru);
+    let jumlah_model = efektif.models.len();
+    s.ganti_config(efektif)?;
+    Ok((jumlah_model, perlu_restart))
+}
+
 /// Membaca ulang file config dan menerapkannya tanpa restart. Config yang tidak valid ditolak seluruhnya (config lama
 /// tetap berjalan). Bagian yang terikat resource terbuka dilaporkan di `perlu_restart` dan tidak berubah.
 async fn muat_ulang(State(s): State<AppState>) -> Hasil {
     let Some(path) = s.config_path.clone() else {
         return Err(galat(StatusCode::CONFLICT, "reload_unavailable", "Gateway tidak dijalankan dari file config; reload tidak tersedia."));
     };
-    let baru = Config::from_file(&path)
-        .map_err(|e| galat(StatusCode::BAD_REQUEST, "config_invalid", format!("Config tidak valid, tidak diterapkan: {e:#}")))?;
-    let lama = s.runtime();
-    let (efektif, perlu_restart) = lama.config.gabung_hot(baru);
-    let jumlah_model = efektif.models.len();
-    s.ganti_config(efektif)
+    let _ = path;
+    let (jumlah_model, perlu_restart) = tokio::task::spawn_blocking(move || muat_ulang_config(&s))
+        .await
+        .map_err(|_| galat(StatusCode::INTERNAL_SERVER_ERROR, "internal", "Pemuatan ulang config gagal."))?
         .map_err(|e| galat(StatusCode::BAD_REQUEST, "config_invalid", format!("Config tidak valid, tidak diterapkan: {e:#}")))?;
     tracing::info!(?perlu_restart, jumlah_model, "config dimuat ulang lewat API admin");
     Ok(Json(json!({ "status": "ok", "jumlah_model": jumlah_model, "perlu_restart": perlu_restart })))
