@@ -37,7 +37,7 @@ class ServerPalsu:
                 self.end_headers()
                 self.wfile.write(data)
 
-            do_GET = do_POST = do_PATCH = do_DELETE = _tangani
+            do_GET = do_POST = do_PATCH = do_PUT = do_DELETE = _tangani
 
             def log_message(self, *a):
                 pass
@@ -97,6 +97,34 @@ class TesKlien(unittest.TestCase):
         self.s.jawaban[("POST", "/admin/keys")] = (201, {"key": "ngk_x", "info": {}})
         self.c.buat_key("baru", None, 30)
         self.assertEqual(self.s.diterima[0]["body"], {"name": "baru", "rpm": None, "tpm": 30})
+
+    def test_metadata_dikirim_saat_buat_dan_ubah(self):
+        self.s.jawaban[("POST", "/admin/keys")] = (201, {"key": "ngk_x", "info": {}})
+        self.s.jawaban[("PATCH", "/admin/keys/a")] = (200, {"info": {}})
+        self.c.buat_key("a", metadata={"client_id": "mall-a"})
+        self.c.ubah_key("a", metadata={"client_id": "mall-b"})
+        self.c.ubah_key("a", metadata=None)
+        self.assertEqual(
+            [r["body"] for r in self.s.diterima],
+            [{"name": "a", "rpm": None, "tpm": None, "metadata": {"client_id": "mall-a"}}, {"metadata": {"client_id": "mall-b"}}, {"metadata": None}],
+        )
+
+    def test_aturan_dan_client_dikirim_ke_jalur_yang_benar(self):
+        self.s.jawaban[("PATCH", "/admin/keys/api")] = (200, {"info": {}})
+        self.s.jawaban[("GET", "/admin/keys/api/users")] = (200, {"key": "api", "users": []})
+        self.s.jawaban[("PUT", "/admin/keys/api/users/ops%40tim")] = (200, {"user": {}})
+        self.s.jawaban[("DELETE", "/admin/keys/api/users/ops%40tim")] = (200, {"dihapus": "ops@tim"})
+        self.c.ubah_key("api", user_rpm=None, user_tpm=500, user_required=True)
+        self.assertEqual(self.c.clients("api")["users"], [])
+        self.c.simpan_client("api", "ops@tim", rpm=3)
+        self.c.hapus_client("api", "ops@tim")
+        self.assertEqual(
+            [(r["metode"], r["path"], r["body"]) for r in self.s.diterima],
+            [("PATCH", "/admin/keys/api", {"user_rpm": None, "user_tpm": 500, "user_required": True}),
+             ("GET", "/admin/keys/api/users", None),
+             ("PUT", "/admin/keys/api/users/ops%40tim", {"rpm": 3, "tpm": None, "active": True}),
+             ("DELETE", "/admin/keys/api/users/ops%40tim", None)],
+        )
 
     def test_query_stats_dan_kejadian(self):
         self.s.jawaban[("GET", "/admin/stats")] = (200, {"baris": []})

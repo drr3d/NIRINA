@@ -38,6 +38,8 @@ pub struct KodeGalat(pub &'static str);
 pub struct Detail {
     pub alias: Option<String>,
     pub upstream: Option<String>,
+    /// Label client dari field `user` request (bila ada dan sah).
+    pub end_user: Option<String>,
     pub percobaan: u32,
     pub token_masuk: Option<u64>,
     pub token_keluar: Option<u64>,
@@ -58,6 +60,7 @@ pub struct Rekaman {
     pub key_name: String,
     pub alias: Option<String>,
     pub upstream: Option<String>,
+    pub end_user: Option<String>,
     pub status: u16,
     pub hasil: &'static str,
     pub kode_galat: Option<String>,
@@ -101,6 +104,8 @@ pub enum Kelompok {
     Upstream,
     Hari,
     Jam,
+    /// Per client: `key/label`, atau `key/-` untuk request tanpa label `user`.
+    User,
 }
 
 impl Kelompok {
@@ -112,7 +117,8 @@ impl Kelompok {
             "upstream" => Self::Upstream,
             "hari" => Self::Hari,
             "jam" => Self::Jam,
-            lain => bail!("kelompok '{lain}' tidak dikenal (semua|key|alias|upstream|hari|jam)"),
+            "user" => Self::User,
+            lain => bail!("kelompok '{lain}' tidak dikenal (semua|key|alias|upstream|hari|jam|user)"),
         })
     }
 
@@ -124,6 +130,7 @@ impl Kelompok {
             Self::Upstream => "COALESCE(upstream, '-')",
             Self::Hari => "strftime('%Y-%m-%d', ts / 1000, 'unixepoch')",
             Self::Jam => "strftime('%Y-%m-%d %H:00', ts / 1000, 'unixepoch')",
+            Self::User => "key_name || '/' || COALESCE(end_user, '-')",
         }
     }
 }
@@ -295,8 +302,8 @@ fn tulis(conn: &mut Connection, buf: &[Rekaman]) -> Result<()> {
     {
         let mut st = tx.prepare_cached(
             "INSERT INTO requests (ts, key_id, key_name, alias, upstream, status, hasil, kode_galat, token_masuk, token_keluar, latensi_ms, percobaan,
-                                   temuan_masuk, temuan_keluar, jenis_temuan)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                                   temuan_masuk, temuan_keluar, jenis_temuan, end_user)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         )?;
         for r in buf {
             st.execute(params![
@@ -314,7 +321,8 @@ fn tulis(conn: &mut Connection, buf: &[Rekaman]) -> Result<()> {
                 r.percobaan,
                 r.temuan_masuk,
                 r.temuan_keluar,
-                r.jenis_temuan
+                r.jenis_temuan,
+                r.end_user
             ])?;
         }
     }
@@ -370,6 +378,11 @@ fn migrasi(conn: &mut Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    // Kolom aditif tanpa menaikkan user_version, supaya rilis lama tetap bisa membuka database ini (rollback TAG).
+    let ada: bool = conn.query_row("SELECT COUNT(*) > 0 FROM pragma_table_info('requests') WHERE name = 'end_user'", [], |r| r.get(0))?;
+    if !ada {
+        conn.execute("ALTER TABLE requests ADD COLUMN end_user TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -420,6 +433,7 @@ pub fn ringkasan_dari_file(path: &str, dari_ms: i64, sampai_ms: i64, kelompok: K
 pub struct Kejadian {
     pub ts_ms: i64,
     pub key_name: String,
+    pub end_user: Option<String>,
     pub alias: Option<String>,
     pub status: u16,
     pub hasil: String,
@@ -436,7 +450,7 @@ pub fn temuan_terbaru_dari_file(path: &str, dari_ms: i64, batas: u32) -> Result<
         .with_context(|| format!("tidak bisa membuka database statistik {path}"))?;
     conn.busy_timeout(Duration::from_secs(5))?;
     let mut st = conn.prepare(
-        "SELECT ts, key_name, alias, status, hasil, temuan_masuk, temuan_keluar, jenis_temuan FROM requests
+        "SELECT ts, key_name, alias, status, hasil, temuan_masuk, temuan_keluar, jenis_temuan, end_user FROM requests
          WHERE ts >= ?1 AND (temuan_masuk + temuan_keluar) > 0 ORDER BY ts DESC, id DESC LIMIT ?2",
     )?;
     let baris = st
@@ -450,6 +464,7 @@ pub fn temuan_terbaru_dari_file(path: &str, dari_ms: i64, batas: u32) -> Result<
                 temuan_masuk: r.get::<_, i64>(5)?.max(0) as u64,
                 temuan_keluar: r.get::<_, i64>(6)?.max(0) as u64,
                 jenis_temuan: r.get(7)?,
+                end_user: r.get(8)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -482,6 +497,7 @@ impl PencatatRequest {
             key_name,
             alias: d.alias.clone(),
             upstream: d.upstream.clone(),
+            end_user: d.end_user.clone(),
             status,
             hasil: klasifikasi(status, kode),
             kode_galat: kode.map(String::from),

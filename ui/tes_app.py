@@ -50,17 +50,38 @@ class KlienPalsu:
 
     def keys(self):
         return [
-            {"id": 1, "name": "nirina-prod", "prefix": "ngk_ab12", "active": True, "created_at": 1790000000, "rpm": None, "tpm": None, "rpm_efektif": 120, "tpm_efektif": None},
+            {"id": 1, "name": "nirina-prod", "prefix": "ngk_ab12", "active": True, "created_at": 1790000000, "rpm": None, "tpm": None, "rpm_efektif": 120, "tpm_efektif": None,
+             "metadata": {"client_id": "tim-x"}, "user_rpm": 30, "user_tpm": None, "user_required": True},
             {"id": 2, "name": "nirina-dev", "prefix": "ngk_cd34", "active": False, "created_at": 1790000100, "rpm": 5, "tpm": 900, "rpm_efektif": 5, "tpm_efektif": 900},
         ]
 
-    def buat_key(self, name, rpm=None, tpm=None):
-        KlienPalsu.panggilan.append(("buat", name, rpm, tpm))
+    def buat_key(self, name, rpm=None, tpm=None, metadata=None):
+        KlienPalsu.panggilan.append(("buat", name, rpm, tpm, metadata))
         return {"key": "ngk_" + "f" * 64, "info": {}}
 
-    def ubah_key(self, name, active=None, rpm=None, tpm=None):
-        KlienPalsu.panggilan.append(("ubah", name, active, rpm, tpm))
+    def ubah_key(self, name, active=None, rpm=None, tpm=None, metadata=None, user_rpm=klien.TIDAK_DIKIRIM, user_tpm=klien.TIDAK_DIKIRIM,
+                 user_required=klien.TIDAK_DIKIRIM):
+        if user_required is not klien.TIDAK_DIKIRIM:
+            KlienPalsu.panggilan.append(("aturan", name, user_rpm, user_tpm, user_required))
+        else:
+            KlienPalsu.panggilan.append(("ubah", name, active, rpm, tpm, metadata))
         return {"info": {}}
+
+    def clients(self, name):
+        if name == "nirina-prod":
+            return {"key": name, "users": [{"user": "mall-a", "rpm": 5, "tpm": None, "active": True, "created_at": 1790000000,
+                                            "rpm_efektif": 5, "tpm_efektif": None},
+                                           {"user": "nakal", "rpm": None, "tpm": None, "active": False, "created_at": 1790000000,
+                                            "rpm_efektif": 30, "tpm_efektif": None}]}
+        return {"key": name, "users": []}
+
+    def simpan_client(self, name, user, rpm=None, tpm=None, active=True):
+        KlienPalsu.panggilan.append(("client", name, user, rpm, tpm, active))
+        return {"user": {}}
+
+    def hapus_client(self, name, user):
+        KlienPalsu.panggilan.append(("hapus_client", name, user))
+        return {"dihapus": user}
 
     def hapus_key(self, name):
         KlienPalsu.panggilan.append(("hapus", name))
@@ -183,7 +204,7 @@ class TesApp(unittest.TestCase):
         at.number_input(key="baru_rpm").set_value(30)
         with mock.patch.dict(os.environ, {"NIGATE_ADMIN_TOKEN": "token-uji"}), mock.patch.object(klien, "KlienAdmin", KlienPalsu):
             next(b for b in at.button if b.label == "Buat key").click().run()
-            self.assertIn(("buat", "tim-baru", 30, None), KlienPalsu.panggilan)
+            self.assertIn(("buat", "tim-baru", 30, None, {}), KlienPalsu.panggilan)
             self.assertTrue(any(c.value.startswith("ngk_") for c in at.code), "key baru ditampilkan")
             self.assertEqual(at.text_input(key="baru_nama").value, "", "input nama dikosongkan")
             next(b for b in at.button if b.label == "Sudah saya simpan").click().run()
@@ -197,7 +218,66 @@ class TesApp(unittest.TestCase):
             at.checkbox(key="rpm_ikut_nirina-dev").set_value(True)
             at.toggle(key="aktif_nirina-dev").set_value(True)
             next(b for b in at.button if b.label == "Simpan perubahan").click().run()
-        self.assertIn(("ubah", "nirina-dev", True, None, 900), KlienPalsu.panggilan)
+        self.assertIn(("ubah", "nirina-dev", True, None, 900, None), KlienPalsu.panggilan)
+
+    def test_buat_key_dengan_metadata(self):
+        at = jalankan(*app_baru())
+        at.text_input(key="baru_nama").set_value("api-mall-a")
+        at.text_area(key="baru_meta").set_value("client_id=mall-a\n\n tier = gold ")
+        with mock.patch.dict(os.environ, {"NIGATE_ADMIN_TOKEN": "token-uji"}), mock.patch.object(klien, "KlienAdmin", KlienPalsu):
+            next(b for b in at.button if b.label == "Buat key").click().run()
+        self.assertIn(("buat", "api-mall-a", None, None, {"client_id": "mall-a", "tier": "gold"}), KlienPalsu.panggilan)
+        self.assertEqual(at.text_area(key="baru_meta").value, "", "metadata dikosongkan setelah key dibuat")
+
+    def test_metadata_salah_format_tidak_memanggil_api(self):
+        at = jalankan(*app_baru())
+        at.text_input(key="baru_nama").set_value("x")
+        at.text_area(key="baru_meta").set_value("client_id mall-a")
+        with mock.patch.dict(os.environ, {"NIGATE_ADMIN_TOKEN": "token-uji"}), mock.patch.object(klien, "KlienAdmin", KlienPalsu):
+            next(b for b in at.button if b.label == "Buat key").click().run()
+        self.assertFalse([p for p in KlienPalsu.panggilan if p[0] == "buat"])
+        self.assertTrue(any("nama=nilai" in e.value for e in at.error))
+
+    def test_metadata_tampil_di_tabel_dan_terisi_di_form_ubah(self):
+        at = jalankan(*app_baru())
+        self.assertTrue(any("client_id=tim-x" in str(d.value.to_dict()) for d in at.dataframe))
+        self.assertEqual(at.text_area(key="meta_nirina-prod").value, "client_id=tim-x")
+        with mock.patch.dict(os.environ, {"NIGATE_ADMIN_TOKEN": "token-uji"}), mock.patch.object(klien, "KlienAdmin", KlienPalsu):
+            at.text_area(key="meta_nirina-prod").set_value("client_id=tim-x\nunit=it")
+            next(b for b in at.button if b.label == "Simpan perubahan").click().run()
+            self.assertIn(("ubah", "nirina-prod", True, None, None, {"client_id": "tim-x", "unit": "it"}), KlienPalsu.panggilan)
+            # Dikosongkan = metadata dihapus (null).
+            at.text_area(key="meta_nirina-prod").set_value("")
+            next(b for b in at.button if b.label == "Simpan perubahan").click().run()
+        self.assertEqual(KlienPalsu.panggilan[-1], ("ubah", "nirina-prod", True, None, None, None))
+
+    def test_aturan_client_terisi_dan_dikirim(self):
+        at = jalankan(*app_baru())
+        self.assertTrue(at.checkbox(key="cwajib_nirina-prod").value)
+        self.assertEqual(at.number_input(key="crpm_nirina-prod").value, 30)
+        with mock.patch.dict(os.environ, {"NIGATE_ADMIN_TOKEN": "token-uji"}), mock.patch.object(klien, "KlienAdmin", KlienPalsu):
+            at.checkbox(key="ctpm_nirina-prod_bebas").set_value(False)
+            at.number_input(key="ctpm_nirina-prod").set_value(20000)
+            next(b for b in at.button if b.label == "Simpan aturan client").click().run()
+        self.assertIn(("aturan", "nirina-prod", 30, 20000, True), KlienPalsu.panggilan)
+
+    def test_client_khusus_tampil_disimpan_dan_dihapus(self):
+        at = jalankan(*app_baru())
+        teks = " ".join(str(d.value.to_dict()) for d in at.dataframe)
+        self.assertIn("mall-a", teks)
+        self.assertIn("Diblokir", teks)
+        with mock.patch.dict(os.environ, {"NIGATE_ADMIN_TOKEN": "token-uji"}), mock.patch.object(klien, "KlienAdmin", KlienPalsu):
+            next(b for b in at.button if b.label == "Simpan client").click().run()
+            self.assertFalse([p for p in KlienPalsu.panggilan if p[0] == "client"], "label kosong tidak boleh dikirim")
+            at.text_input(key="cuser_nirina-prod").set_value("mall-b")
+            at.checkbox(key="cu_rpm_ikut_nirina-prod").set_value(False)
+            at.number_input(key="cu_rpm_nirina-prod").set_value(7)
+            at.toggle(key="cu_aktif_nirina-prod").set_value(False)
+            next(b for b in at.button if b.label == "Simpan client").click().run()
+            self.assertIn(("client", "nirina-prod", "mall-b", 7, None, False), KlienPalsu.panggilan)
+            at.selectbox(key="chapus_nirina-prod").set_value("nakal")
+            next(b for b in at.button if b.label == "Hapus pengaturan client").click().run()
+        self.assertIn(("hapus_client", "nirina-prod", "nakal"), KlienPalsu.panggilan)
 
     def test_hapus_butuh_konfirmasi(self):
         at = jalankan(*app_baru())

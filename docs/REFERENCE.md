@@ -37,7 +37,7 @@ Every command in this reference runs from the folder that contains `Cargo.toml` 
 
 nigate is one process that speaks the OpenAI chat-completions protocol on the front and talks to one or more real providers on the back. Your application only changes its `base_url` and uses a **virtual key** (`ngk_...`) instead of a provider key. Provider keys never leave the gateway's environment.
 
-It is deliberately small. It consists of one binary, two SQLite files and one TOML config file. It exposes three data-plane routes: `GET /healthz`, `GET /v1/models` and `POST /v1/chat/completions`.
+It is deliberately small. It consists of one binary, two SQLite files and one TOML config file. It exposes four data-plane routes: `GET /healthz`, `GET /v1/models`, `GET /v1/key/info` and `POST /v1/chat/completions`.
 
 ### When to use it
 
@@ -60,7 +60,8 @@ It is deliberately small. It consists of one binary, two SQLite files and one TO
 ## Features
 
 - **OpenAI-compatible surface:** `POST /v1/chat/completions` (non-streaming), `GET /v1/models` (lists your aliases) and an open `GET /healthz`. Tool calling (`tools`, `tool_calls`) passes through.
-- **Virtual keys:** `ngk_` plus 64 hex characters. Only a SHA-256 hash is stored, and the plaintext is shown once at creation. Keys can be revoked, re-enabled and limited individually.
+- **Per-client limits under one key:** an application that serves many clients through one key sends each client's label in the standard OpenAI `user` field. nigate limits (RPM/TPM), blocks and counts per label, under the key's own limit, and strips the field before the provider sees it.
+- **Virtual keys:** `ngk_` plus 64 hex characters. Only a SHA-256 hash is stored, and the plaintext is shown once at creation. Keys can be revoked, re-enabled and limited individually, and can carry free-form metadata labels (for example `client_id`) that an application reads back with `GET /v1/key/info`.
 - **Rate limits:** a per-key token bucket for requests per minute (RPM) and tokens per minute (TPM), with optional defaults in the config.
 - **Model aliases with ordered upstreams:** one alias maps to a prioritised list of providers. Failures trigger retries with backoff, failover, a passive cooldown and a total time budget.
 - **Two-way guardrail:** 15 built-in secret rules plus an entropy detector, optional custom regex rules, and `redact`, `block` or `log_only` modes (per rule if you like).
@@ -115,7 +116,7 @@ The order matters, because it decides what costs quota:
 4. **Rate limit.** The per-key RPM/TPM bucket is checked twice. The first check runs right after auth, **before the body is parsed or scanned**, and spends nothing, so a key that is already over its limit costs almost no CPU. The second check, just before the upstream call, spends the quota. A rejection gives `429 rate_limit_exceeded` plus `Retry-After`.
 5. **Failover.** The request is sent to the upstreams in order. `model` is overwritten with each upstream's real model name, and a `Bearer` header with the provider key is added if one is configured. Client headers are not forwarded, and the virtual key is never sent upstream.
 6. **Response guardrail and accounting.** For a successful JSON answer, nigate reads `usage`, corrects the TPM bucket, scans the completion, and then returns it.
-7. **Stats.** A metadata row is queued. This covers every request that passed auth on the chat route, including 400, 429 and 5xx results. 401s and `/v1/models` calls are not recorded. A request the client abandons (closes the connection or times out first) is recorded too, as status `499` with code `client_cancelled` and outcome `klien`, and its TPM estimate is refunded. A request refused by the early rate-limit check has no `alias` in its row, because the body was never parsed.
+7. **Stats.** A metadata row is queued. This covers every request that passed auth on the chat route, including 400, 429 and 5xx results. 401s, `/v1/models` and `/v1/key/info` calls are not recorded. A request the client abandons (closes the connection or times out first) is recorded too, as status `499` with code `client_cancelled` and outcome `klien`, and its TPM estimate is refunded. A request refused by the early rate-limit check has no `alias` in its row, because the body was never parsed.
 
 Successful responses carry `x-nigate-upstream` (the upstream's `name`, never its URL) and `x-nigate-attempts` (number of upstream calls, including retries).
 
@@ -223,12 +224,13 @@ With `-i` you can see `x-nigate-upstream` and `x-nigate-attempts`. `chat-main` i
 
 ```
 nigate [-c|--config <file>] [serve]                        run the gateway (default command)
-nigate [-c <file>] key create <name>                       create a virtual key (shown once)
+nigate [-c <file>] key create <name> [k=v ...]             create a virtual key (shown once), with optional metadata
 nigate [-c <file>] key list                                list keys (rpm/tpm: "-" = not set)
 nigate [-c <file>] key limit <name> [--rpm N|none] [--tpm N|none]
 nigate [-c <file>] key revoke <name>                       deactivate a key
 nigate [-c <file>] key enable <name>                       re-activate a revoked key
-nigate [-c <file>] stats [--jam N | --hari N] [--per semua|key|alias|upstream|hari|jam]
+nigate [-c <file>] key meta <name> [k=v ...]               replace a key's metadata (no k=v clears it)
+nigate [-c <file>] stats [--jam N | --hari N] [--per semua|key|alias|upstream|hari|jam|user]
 nigate [-c <file>] guardrail cek [file]                    test guardrail rules on stdin or a file
 nigate admin token                                         print a new random admin token (no config needed)
 nigate [-c <file>] healthcheck                             GET http://127.0.0.1:<port>/healthz, 2 s timeout, exit 0 = healthy
@@ -398,6 +400,41 @@ CLI changes made while the server runs are picked up within about 2 seconds, bec
   - Requests rejected earlier (invalid JSON, unknown alias, guardrail block) consume nothing.
 - Limiter state resets on restart; every key then starts with a full bucket. Entries are never pruned while running.
 
+**Metadata.** A key can carry up to 16 labels, `name=value`, for the application in front of the gateway. A name follows the key-name rules (1 to 64 characters of `[A-Za-z0-9_.-]`); a value is text of at most 256 characters without control characters. nigate never interprets them. Set them at creation (`key create <name> client_id=acme`, or `"metadata"` in `POST /admin/keys`) and replace them later (`key meta`, or `PATCH`). Metadata is not secret: it is returned to anyone who holds the key.
+
+**Key info.** `GET /v1/key/info`, authenticated with the key itself (`Authorization: Bearer ngk_...`), tells the caller who the key belongs to and how much of its limit is left:
+
+```json
+{
+  "object": "key_info",
+  "name": "svc-example",
+  "prefix": "ngk_1a2b",
+  "active": true,
+  "created_at": 1790000000,
+  "metadata": {"client_id": "acme"},
+  "limits": {"rpm": 60, "tpm": 100000},
+  "remaining": {"rpm": 59, "tpm": 98750}
+}
+```
+
+- `limits` are the effective limits (the key's own value, else the default; `null` = unlimited). `remaining` is the current bucket balance rounded down, `null` where no limit applies.
+- The call consumes no quota and is not recorded in stats, so an application can make it at the start of every request it serves, for example to map the caller's key to an account through `metadata`.
+- An unknown, revoked or missing key gets the same `401` codes as the chat route. Responses carry `Cache-Control: no-store`.
+- In anonymous mode the name is `anonim` and `metadata` is empty.
+
+**Clients under one key (`user`).** An application that serves many end clients through one key (a backend in front of nigate) can have each client limited and counted separately:
+
+- The application puts a label for the client in the standard OpenAI `user` field of each chat request, for example `"user": "acme"`, or in the `X-Nigate-User` header. The header is easier to add from an HTTP-client hook without touching request bodies. If both are sent they must be equal, otherwise `400 invalid_user`.
+- A label is 1 to 64 characters of `[A-Za-z0-9_.:@-]`. A non-text or malformed label gets `400 invalid_user`; an empty string counts as no label.
+- nigate removes `user` before forwarding and never forwards client headers, so client labels never reach a provider.
+- Per key you can set a **default per-client limit** (`user_rpm`, `user_tpm`) and **require a label** (`user_required`: requests without one get `400 user_required`). Per client you can set its **own limits** or **block it** (`403 user_blocked`). Clients without their own settings use the key's defaults; with no default they are not limited individually.
+- A request must pass both the client's bucket and the key's bucket. A client refused by its own limit gets `429 rate_limit_exceeded` with `"param": "user"` in the error and consumes nothing from the key; a refusal by the key's limit has no `param`. TPM is corrected and refunded on both buckets.
+- Statistics record the label: `GET /admin/stats?per=user` groups by `key/label` (`key/-` for requests without one). Guardrail events carry `end_user`.
+- Client buckets live in memory like key buckets. When more than 50,000 buckets exist, buckets that have refilled completely are dropped as new clients arrive; this does not change any limit.
+- `GET /v1/key/info` reports `user_required` and `user_limits` (the key's per-client defaults). With `?user=<label>` it adds a `user` object: `name`, `active` (false = blocked), effective `limits`, and `remaining`.
+
+Manage it in the dashboard (Key & Limit tab, "Client" section) or the admin API (`user_rpm`, `user_tpm`, `user_required` on the key; `/admin/keys/{nama}/users/...` per client).
+
 **Anonymous mode.** With `auth.required = false`, requests are anonymous (recorded in stats as key `anonim`) and no limits apply, not even the defaults. Use it for local development only.
 
 ---
@@ -461,11 +498,12 @@ Errors use the OpenAI-style envelope described in [Architecture and request path
 
 | Status and `code` | Meaning for the client | Retry? |
 |---|---|---|
-| `400` `invalid_json`, `invalid_body`, `missing_model`, `stream_unsupported` | The request itself is wrong. For `stream_unsupported`, turn streaming off | No, fix the request |
+| `400` `invalid_json`, `invalid_body`, `missing_model`, `stream_unsupported`, `invalid_user`, `user_required` | The request itself is wrong. For `stream_unsupported`, turn streaming off. `invalid_user`: the `user` label (body or `X-Nigate-User` header) is not text, not 1 to 64 characters of `[A-Za-z0-9_.:@-]`, or body and header disagree. `user_required`: this key needs a `user` label | No, fix the request |
 | `401` `missing_api_key`, `invalid_api_key` | No key, or an unknown or revoked key. The response carries `WWW-Authenticate: Bearer` | No, fix the key |
 | `403` `guardrail_blocked` | A `block`-mode guardrail rule matched the request. Nothing was sent to a provider and no quota was spent | No: the same body is blocked again. Remove the secret first |
+| `403` `user_blocked` | The client named in `user` is blocked on this key | No, until an operator unblocks it |
 | `404` `model_not_found` | The `model` value is not an alias of this gateway | No, fix the alias |
-| `429` `rate_limit_exceeded` | The key's own RPM or TPM is exhausted. `Retry-After` gives the wait in whole seconds (1 to 3600) | Yes, after `Retry-After` |
+| `429` `rate_limit_exceeded` | The key's own RPM or TPM is exhausted, or, with `"param": "user"` in the error, the limit of the client named in `user`. `Retry-After` gives the wait in whole seconds (1 to 3600) | Yes, after `Retry-After` |
 | `502` `guardrail_blocked` | A `block`-mode rule matched the provider's *response* (the provider was already billed) | Usually not: the same prompt tends to give the same result |
 | `502` `upstream_unreachable`, `upstream_read_failed`, `upstream_response_too_large`, `upstream_invalid_response`, `upstream_redirect`; `504` `upstream_timeout` | Every upstream tried failed at transport level. nigate has already retried and failed over within its budget | Yes, later, with backoff |
 | `502` `upstream_auth_failed` | The provider rejected the gateway's own credentials (a wrong or revoked provider key inside nigate). An operator problem; the provider's body is deliberately not forwarded | Not until the operator fixes it |
@@ -605,12 +643,15 @@ A separate listener (`admin.listen`, default `127.0.0.1:4001`) serves a JSON API
 | `GET /admin/health` | Status, version (`versi`), uptime (`uptime_detik`), `auth_required`, number of models, `stats_aktif`, `statistik_dibuang`, `guardrail_aktif`, `reload_tersedia` |
 | `GET /admin/config` | Effective config without secrets (a subset: it does not show `max_response_mb`, `shutdown_grace_secs`, the two `db_path` values, `admin.enabled`/`token_env` or custom-rule patterns). Upstream URLs have any `user:password@` removed; env-var names are shown, values never |
 | `POST /admin/reload` | Re-read the config file and apply it. An invalid file is rejected whole (`400 config_invalid`) and the old config keeps running. Returns `{"status","jumlah_model","perlu_restart"}` |
-| `GET /admin/keys` | List keys with limits and effective limits (`rpm_efektif`, `tpm_efektif`) |
-| `POST /admin/keys` | Create a key. Body `{"name": "...", "rpm"?: N, "tpm"?: N}`. Returns `201` with `{"key": "ngk_...", "info": {...}}`. This is the only time the key is returned |
-| `PATCH /admin/keys/{nama}` | Change `active`, `rpm`, `tpm`. A field that is absent stays unchanged. `null` clears a limit. Unknown fields are rejected |
-| `DELETE /admin/keys/{nama}` | Delete a key permanently (statistics history stays). Returns `{"dihapus": "<name>"}` |
+| `GET /admin/keys` | List keys with limits, effective limits (`rpm_efektif`, `tpm_efektif`), `metadata` and client rules (`user_rpm`, `user_tpm`, `user_required`) |
+| `POST /admin/keys` | Create a key. Body `{"name": "...", "rpm"?: N, "tpm"?: N, "metadata"?: {"k": "v"}, "user_rpm"?: N, "user_tpm"?: N, "user_required"?: bool}`. Returns `201` with `{"key": "ngk_...", "info": {...}}`. This is the only time the key is returned |
+| `PATCH /admin/keys/{nama}` | Change `active`, `rpm`, `tpm`, `metadata`, `user_rpm`, `user_tpm`, `user_required`. A field that is absent stays unchanged. `null` clears a limit or the metadata. `metadata` replaces the whole set. Unknown fields are rejected |
+| `DELETE /admin/keys/{nama}` | Delete a key permanently, with its client settings (statistics history stays). Returns `{"dihapus": "<name>"}` |
+| `GET /admin/keys/{nama}/users` | The key's client rules and the clients that have their own settings: `user`, `rpm`, `tpm`, `active`, `created_at`, `rpm_efektif`, `tpm_efektif` |
+| `PUT /admin/keys/{nama}/users/{user}` | Create or replace one client's settings. Body `{"rpm"?: N, "tpm"?: N, "active"?: bool}`; an absent limit follows the key's per-client default, `active` defaults to true. Returns `{"user": {...}}` |
+| `DELETE /admin/keys/{nama}/users/{user}` | Remove one client's settings (it falls back to the key's defaults). `404 user_not_found` if it had none |
 | `GET /admin/upstreams` | Per alias and upstream: order, `name`, model, URL, `key_env`, `terkonfigurasi`, timeout, `gagal_beruntun`, `dalam_cooldown`, `sisa_cooldown_detik` |
-| `GET /admin/stats?jam=24&per=semua` | Aggregated usage. `jam` is 1 to 8760 (default 24). `per` is `semua` (default), `key`, `alias`, `upstream`, `hari` or `jam` |
+| `GET /admin/stats?jam=24&per=semua` | Aggregated usage. `jam` is 1 to 8760 (default 24). `per` is `semua` (default), `key`, `alias`, `upstream`, `hari`, `jam` or `user` |
 | `GET /admin/guardrail/events?jam=24&limit=100` | Recent requests that triggered the guardrail (metadata only). `jam` is 1 to 8760 (default 24), `limit` is 1 to 1000 (default 100) |
 
 Examples (POSIX shell):
@@ -634,7 +675,7 @@ curl -X POST  -H "$H" "$A/admin/reload"
 - **Token sums.** Token counts come from the provider's `usage` on 2xx JSON upstream responses, including ones nigate then blocks with `502 guardrail_blocked`. If a provider reports only `total_tokens`, the input and output columns stay empty.
 - **Query parsing.** Parameters are not percent-decoded, unknown parameters are ignored, and `per` is case-sensitive.
 
-**Admin error codes.** `invalid_admin_token` (401); `invalid_body`, `invalid_name`, `invalid_limit`, `no_changes` (an empty JSON object on PATCH), `invalid_query`, `config_invalid` (400); `key_not_found` (404); `name_taken`, `reload_unavailable` (409, raised when the gateway was not started from a config file); `internal` (500).
+**Admin error codes.** `invalid_admin_token` (401); `invalid_body`, `invalid_name`, `invalid_limit`, `invalid_metadata`, `invalid_user`, `no_changes` (an empty JSON object on PATCH), `invalid_query`, `config_invalid` (400); `key_not_found`, `user_not_found` (404); `name_taken`, `reload_unavailable` (409, raised when the gateway was not started from a config file); `internal` (500).
 
 ---
 
@@ -770,7 +811,7 @@ Use absolute database paths in the config. Restrict `nigate.env` and the SQLite 
 - **Guardrail coverage.** See [Guardrail](#guardrail): unscanned fields, unscanned non-`choices` responses, no PII, heuristic entropy, position-based overlap resolution, and a global policy.
 - **Statistics are lossy by design.** The queue holds 20,000 records. When it is full or a write fails, records are dropped and only counted in memory (`statistik_dibuang`, reset on restart). `/admin/guardrail/events` is therefore not an audit log. Statistics are visible within about a second, not instantly. A deleted and recreated key name merges into the old name's history.
 - **Key id reuse.** `api_keys.id` is a plain `INTEGER PRIMARY KEY`, so SQLite may reuse an id after the newest key is deleted. The limiter is keyed by that id and never pruned, so a recreated key could inherit an old bucket until restart. Prefer revoking over deleting.
-- **Admin mutations are not transactional.** Creating a key with limits is two steps, and `PATCH` is read-then-write. Concurrent edits can overwrite each other.
+- **Admin mutations are not transactional.** Creating a key with limits or metadata takes several steps, and `PATCH` is read-then-write. Concurrent edits can overwrite each other.
 - **Silent config typos** outside `[admin]` and `[guardrail]` (see [Configuration](#configuration)).
 - **Oversized bodies.** A request or admin body over its size limit is rejected by the HTTP layer. The reply may not use the OpenAI JSON error format; no nigate code or test handles it.
 - **Very large `stats` arguments.** `nigate stats --jam/--hari` has no upper bound (the API caps at 8760 hours), so absurdly large values may overflow.

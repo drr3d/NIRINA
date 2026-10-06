@@ -9,10 +9,10 @@ use std::{
 use axum::{
     Extension, Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State},
-    http::{HeaderValue, StatusCode, header},
+    extract::{DefaultBodyLimit, RawQuery, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
@@ -24,8 +24,8 @@ use crate::{
     failover::{self, Gagal},
     guardrail::{Guardrail, Laporan},
     kesehatan::Kesehatan,
-    keys::KeyStore,
-    limiter::Limiter,
+    keys::{KeyStore, validasi_user},
+    limiter::{Batas, Limiter, Penolakan, Subjek},
     platform::SumberPlatform,
     stats::{Jejak, Statistik, catat_statistik},
     util::{baca, ke_i64, kunci, tulis},
@@ -111,8 +111,11 @@ pub fn app(state: AppState) -> Router {
     let chat = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .layer(middleware::from_fn_with_state(state.clone(), catat_statistik));
-    let v1 =
-        Router::new().route("/v1/models", get(daftar_model)).merge(chat).layer(middleware::from_fn_with_state(state.clone(), autentikasi));
+    let v1 = Router::new()
+        .route("/v1/models", get(daftar_model))
+        .route("/v1/key/info", get(info_key))
+        .merge(chat)
+        .layer(middleware::from_fn_with_state(state.clone(), autentikasi));
     Router::new().route("/healthz", get(healthz)).merge(v1).layer(DefaultBodyLimit::max(batas)).with_state(state)
 }
 
@@ -149,6 +152,102 @@ async fn daftar_model(State(s): State<AppState>) -> Json<Value> {
     let rt = s.runtime();
     let data: Vec<Value> = rt.config.urutan_alias.iter().map(|a| json!({ "id": a, "object": "model", "owned_by": "nigate" })).collect();
     Json(json!({ "object": "list", "data": data }))
+}
+
+/// Identitas key pemanggil: nama, metadata, batas efektif, dan sisa jatah saat ini. Diautentikasi dengan key itu sendiri,
+/// tidak memakai jatah dan tidak dicatat di statistik, supaya aplikasi bisa memanggilnya di awal setiap request kliennya
+/// (mis. untuk mengetahui `client_id` pemilik key) tanpa mengurangi kuota.
+async fn info_key(State(s): State<AppState>, Extension(ident): Extension<Identitas>, RawQuery(q): RawQuery) -> Result<Response, ApiError> {
+    let sekarang = Instant::now();
+    let user = q
+        .as_deref()
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|p| p.split_once('='))
+        .find(|(k, _)| *k == "user")
+        .map(|(_, v)| dekode_persen(v).ok_or_else(|| ApiError::bad_request("invalid_user", "Parameter 'user' tidak valid.")))
+        .transpose()?
+        .filter(|v| !v.is_empty())
+        .map(|v| label_user(&v))
+        .transpose()?;
+    let (rpm, tpm) = s.limiter.sisa(ident.key_id, ident.rpm, ident.tpm, sekarang);
+    let k = ident.info.as_deref();
+    let mut body = json!({
+        "object": "key_info",
+        "name": ident.nama,
+        "prefix": k.map(|k| k.prefix.as_str()),
+        "active": true,
+        "created_at": k.map(|k| k.created_at),
+        "metadata": k.map_or_else(|| json!({}), |k| json!(k.metadata)),
+        "limits": { "rpm": ident.rpm, "tpm": ident.tpm },
+        "remaining": { "rpm": rpm, "tpm": tpm },
+        "user_required": k.is_some_and(|k| k.user_required),
+        "user_limits": { "rpm": k.and_then(|k| k.user_rpm), "tpm": k.and_then(|k| k.user_tpm) },
+    });
+    if let Some(u) = user {
+        let (batas, aktif) = batas_client(&s, &ident, &u);
+        let (rpm, tpm) = s.limiter.sisa_untuk(&batas, sekarang);
+        body["user"] = json!({
+            "name": &*u,
+            "active": aktif,
+            "limits": { "rpm": batas.rpm, "tpm": batas.tpm },
+            "remaining": { "rpm": rpm, "tpm": tpm },
+        });
+    }
+    let mut r = Json(body).into_response();
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(r)
+}
+
+/// Header alternatif untuk label client (sama artinya dengan field `user` di body).
+pub const HEADER_USER: &str = "x-nigate-user";
+
+/// Dekode `%XX` (dan `+` sebagai spasi) pada nilai query. None bila urutan persen rusak atau hasilnya bukan UTF-8.
+fn dekode_persen(t: &str) -> Option<String> {
+    let b = t.as_bytes();
+    let mut keluar = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+                keluar.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            b'+' => {
+                keluar.push(b' ');
+                i += 1;
+            }
+            c => {
+                keluar.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(keluar).ok()
+}
+
+/// Label client yang sah, atau 400 `invalid_user`.
+fn label_user(t: &str) -> Result<Arc<str>, ApiError> {
+    validasi_user(t).map_err(|e| ApiError { param: Some("user"), ..ApiError::bad_request("invalid_user", format!("{e}.")) })?;
+    Ok(Arc::from(t))
+}
+
+/// Batas efektif sebuah client di bawah key pemanggil (pengaturan khusus client, atau bawaan per client dari key) dan
+/// apakah client itu aktif (tidak diblokir).
+fn batas_client(s: &AppState, ident: &Identitas, user: &Arc<str>) -> (Batas, bool) {
+    let khusus = s.keys.client(ident.key_id, user);
+    let k = ident.info.as_deref();
+    let rpm = khusus.as_ref().and_then(|c| c.rpm).or(k.and_then(|k| k.user_rpm));
+    let tpm = khusus.as_ref().and_then(|c| c.tpm).or(k.and_then(|k| k.user_tpm));
+    (Batas { subjek: Subjek::Client(ident.key_id, Arc::clone(user)), rpm, tpm }, khusus.is_none_or(|c| c.active))
+}
+
+fn galat_limit(p: Penolakan) -> ApiError {
+    match &p.subjek {
+        Subjek::Client(_, u) => ApiError::rate_limited_client(p.tolak, u),
+        Subjek::Key(_) => ApiError::rate_limited(p.tolak),
+    }
 }
 
 fn tambah_header_nigate(mut b: axum::http::response::Builder, upstream: Option<&str>, percobaan: u32) -> axum::http::response::Builder {
@@ -209,19 +308,30 @@ async fn saring_request(rt: &Arc<Runtime>, req: Value, besar: bool) -> Result<(V
 /// Dilepas (`lepas`) begitu jatah sudah dikoreksi dengan `usage` asli.
 struct JatahGuard {
     limiter: Arc<Limiter>,
-    key_id: i64,
+    /// Pemilik ember TPM yang ikut dipotong estimasi (key, dan client bila ada).
+    subjek: Vec<Subjek>,
     estimasi: u64,
     aktif: AtomicBool,
 }
 
 impl JatahGuard {
-    fn baru(limiter: &Arc<Limiter>, key_id: i64, estimasi: u64) -> Self {
-        Self { limiter: Arc::clone(limiter), key_id, estimasi, aktif: AtomicBool::new(true) }
+    fn baru(limiter: &Arc<Limiter>, subjek: Vec<Subjek>, estimasi: u64) -> Self {
+        Self { limiter: Arc::clone(limiter), subjek, estimasi, aktif: AtomicBool::new(true) }
     }
 
     fn kembalikan(&self) {
         if self.aktif.swap(false, Ordering::SeqCst) {
-            self.limiter.koreksi_token(self.key_id, -ke_i64(self.estimasi));
+            for s in &self.subjek {
+                self.limiter.koreksi(s, -ke_i64(self.estimasi));
+            }
+        }
+    }
+
+    /// Mengoreksi estimasi dengan pemakaian asli di semua ember.
+    fn koreksi(&self, total: u64) {
+        let selisih = ke_i64(total).saturating_sub(ke_i64(self.estimasi));
+        for s in &self.subjek {
+            self.limiter.koreksi(s, selisih);
         }
     }
 
@@ -237,12 +347,10 @@ impl Drop for JatahGuard {
 }
 
 struct Konteks<'a> {
-    s: &'a AppState,
     rt: &'a Arc<Runtime>,
     ident: &'a Identitas,
     jejak: &'a Jejak,
     alias: &'a str,
-    estimasi: u64,
     jatah: JatahGuard,
 }
 
@@ -277,10 +385,8 @@ impl Konteks<'_> {
         };
 
         if let Some(u) = usage {
-            if self.ident.tpm.is_some()
-                && let Some(total) = u.jumlah()
-            {
-                self.s.limiter.koreksi_token(self.ident.key_id, ke_i64(total).saturating_sub(ke_i64(self.estimasi)));
+            if let Some(total) = u.jumlah() {
+                self.jatah.koreksi(total);
             }
             let mut d = kunci(&self.jejak.0);
             (d.token_masuk, d.token_keluar) = (u.masuk, u.keluar);
@@ -337,9 +443,11 @@ fn galat_upstream(g: Gagal, percobaan: u32) -> Result<Response, ApiError> {
 /// dan kunci pengalih rute milik agregator seperti OpenRouter, yang bisa menimpa model/penyedia yang dipatok di config.
 const KUNCI_PENGALIH_RUTE: [&str; 5] = ["provider", "models", "route", "transforms", "plugins"];
 
+/// `user` (label client) juga dibuang: itu urusan gateway, dan identitas client tidak perlu sampai ke provider.
 fn bersihkan_parameter(req: &mut Value) {
     if let Some(o) = req.as_object_mut() {
         o.remove("stream");
+        o.remove("user");
         for k in KUNCI_PENGALIH_RUTE {
             o.remove(k);
         }
@@ -350,6 +458,7 @@ async fn chat_completions(
     State(s): State<AppState>,
     Extension(ident): Extension<Identitas>,
     Extension(jejak): Extension<Jejak>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     // Perkiraan kasar token masukan (~4 byte/token); dikoreksi dengan `usage` asli setelah respons.
@@ -376,6 +485,58 @@ async fn chat_completions(
     // upstream yang longgar, lalu balasan SSE-nya lolos tanpa pemindaian guardrail.
     if !matches!(obj.get("stream"), None | Some(Value::Null) | Some(Value::Bool(false))) {
         return Err(ApiError::bad_request("stream_unsupported", "Streaming belum didukung gateway ini."));
+    }
+    // Label client (field `user` standar OpenAI). Teks kosong = tidak ada.
+    // Label client: field standar OpenAI `user`, atau header `X-Nigate-User` (lebih mudah disisipkan aplikasi lewat hook HTTP
+    // tanpa mengubah body). Teks kosong = tidak ada. Keduanya ada tetapi berbeda = galat, bukan menebak mana yang benar.
+    let dari_body = match obj.get("user") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t)) if t.is_empty() => None,
+        Some(Value::String(t)) => Some(label_user(t)?),
+        Some(_) => return Err(ApiError { param: Some("user"), ..ApiError::bad_request("invalid_user", "Field 'user' harus teks.") }),
+    };
+    let dari_header = match headers.get(HEADER_USER) {
+        None => None,
+        Some(v) => match v.to_str().map(str::trim) {
+            Ok("") => None,
+            Ok(t) => Some(label_user(t)?),
+            Err(_) => {
+                return Err(ApiError { param: Some("user"), ..ApiError::bad_request("invalid_user", "Header X-Nigate-User tidak valid.") });
+            }
+        },
+    };
+    let user = match (dari_body, dari_header) {
+        (Some(a), Some(b)) if a != b => {
+            return Err(ApiError {
+                param: Some("user"),
+                ..ApiError::bad_request("invalid_user", "Field 'user' dan header X-Nigate-User berbeda; kirim salah satu.")
+            });
+        }
+        (a, b) => a.or(b),
+    };
+    if user.is_none() && ident.info.as_ref().is_some_and(|k| k.user_required) {
+        return Err(ApiError {
+            param: Some("user"),
+            ..ApiError::bad_request("user_required", "Key ini wajib menyertakan field 'user' (label client).")
+        });
+    }
+    kunci(&jejak.0).end_user = user.as_deref().map(String::from);
+    let mut batas = vec![Batas { subjek: Subjek::Key(ident.key_id), rpm: ident.rpm, tpm: ident.tpm }];
+    if let Some(u) = &user {
+        let (b, aktif) = batas_client(&s, &ident, u);
+        if !aktif {
+            tracing::info!(key = %ident.nama, user = %u, "request ditolak: client diblokir");
+            return Err(ApiError {
+                param: Some("user"),
+                ..ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "invalid_request_error",
+                    "user_blocked",
+                    format!("Client '{u}' diblokir di gateway."),
+                )
+            });
+        }
+        batas.push(b);
     }
 
     let rt = s.runtime();
@@ -407,18 +568,16 @@ async fn chat_completions(
         }
     }
 
-    s.limiter.coba(ident.key_id, ident.rpm, ident.tpm, estimasi, Instant::now()).map_err(|t| {
-        tracing::info!(alias = %alias, key = %ident.nama, batas = t.nama(), "request ditolak: rate limit");
-        ApiError::rate_limited(t)
+    s.limiter.coba_semua(&batas, estimasi, Instant::now()).map_err(|p| {
+        tracing::info!(alias = %alias, key = %ident.nama, user = ?user.as_deref(), batas = p.tolak.nama(), "request ditolak: rate limit");
+        galat_limit(p)
     })?;
     let ctx = Konteks {
-        s: &s,
         rt: &rt,
         ident: &ident,
         jejak: &jejak,
         alias: &alias,
-        estimasi,
-        jatah: JatahGuard::baru(&s.limiter, ident.key_id, estimasi),
+        jatah: JatahGuard::baru(&s.limiter, batas.into_iter().filter(|b| b.tpm.is_some()).map(|b| b.subjek).collect(), estimasi),
     };
 
     let akhir = failover::jalankan(&s, &alias, &siap, &mut req, &ident.nama).await;

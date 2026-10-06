@@ -7,7 +7,7 @@ use nigate::{
     app,
     config::Config,
     guardrail::{Guardrail, Laporan},
-    keys::KeyStore,
+    keys::{KeyStore, Metadata, validasi_metadata},
     platform::{self, SumberPlatform},
     stats::{Baris, Kelompok, Statistik, ringkasan_dari_file, sekarang_ms},
 };
@@ -16,15 +16,16 @@ use tracing_subscriber::EnvFilter;
 const BANTUAN: &str = "\
 Pemakaian:
   nigate [--config <file>] [serve]          jalankan gateway (bawaan)
-  nigate [--config <file>] key create <nama>   buat virtual key (key asli hanya tampil sekali)
+  nigate [--config <file>] key create <nama> [k=v ...]   buat virtual key (key asli hanya tampil sekali), opsional metadata
   nigate [--config <file>] key list            daftar key
   nigate [--config <file>] healthcheck         cek /healthz lokal (exit 0 = sehat)
   nigate admin token                          buat token acak untuk API admin
   nigate [--config <file>] guardrail cek [file]   uji aturan guardrail pada teks (stdin/file)
-  nigate [--config <file>] stats [--jam N | --hari N] [--per semua|key|alias|upstream|hari]   ringkasan pemakaian
+  nigate [--config <file>] stats [--jam N | --hari N] [--per semua|key|alias|upstream|hari|jam|user]   ringkasan pemakaian
   nigate [--config <file>] key limit <nama> [--rpm N|none] [--tpm N|none]   atur batas per menit
   nigate [--config <file>] key revoke <nama>   cabut key
   nigate [--config <file>] key enable <nama>   aktifkan lagi key yang dicabut
+  nigate [--config <file>] key meta <nama> [k=v ...]   ganti seluruh metadata key (tanpa k=v = kosongkan)
 
 Config: --config/-c, atau env NIGATE_CONFIG, atau ./nigate.toml.";
 
@@ -82,9 +83,22 @@ fn baca_argumen() -> (String, Vec<String>) {
 fn perintah_key(cfg: &Config, aksi: &str, rest: &[&str]) -> Result<()> {
     let store = KeyStore::open(&cfg.db_path)?;
     match (aksi, rest) {
-        ("create", [nama]) => {
+        ("create", [nama, meta @ ..]) => {
+            // Metadata divalidasi sebelum key dibuat, supaya argumen salah tidak meninggalkan key tanpa metadata.
+            let meta = baca_metadata(meta)?;
+            validasi_metadata(&meta)?;
             let (info, token) = store.create(nama)?;
+            if !meta.is_empty() {
+                store.set_metadata(nama, &meta)?;
+            }
             println!("Key '{}' dibuat. Simpan sekarang, key ini tidak akan ditampilkan lagi:\n\n  {token}\n", info.name);
+        }
+        ("meta", [nama, meta @ ..]) => {
+            let meta = baca_metadata(meta)?;
+            if !store.set_metadata(nama, &meta)? {
+                bail!("key '{nama}' tidak ditemukan");
+            }
+            println!("Key '{nama}': metadata {}", tampil_metadata(&meta));
         }
         ("list", []) => {
             if store.list()?.is_empty() {
@@ -92,13 +106,14 @@ fn perintah_key(cfg: &Config, aksi: &str, rest: &[&str]) -> Result<()> {
             }
             for k in store.list()? {
                 println!(
-                    "{:>3}  {:<24} {}…  {:<8} rpm={} tpm={}",
+                    "{:>3}  {:<24} {}…  {:<8} rpm={} tpm={} {}",
                     k.id,
                     k.name,
                     k.prefix,
                     if k.active { "aktif" } else { "DICABUT" },
                     tampil_batas(k.rpm),
-                    tampil_batas(k.tpm)
+                    tampil_batas(k.tpm),
+                    tampil_metadata(&k.metadata)
                 );
             }
         }
@@ -131,6 +146,20 @@ fn perintah_key(cfg: &Config, aksi: &str, rest: &[&str]) -> Result<()> {
         _ => bail!("perintah key tidak dikenal.\n\n{BANTUAN}"),
     }
     Ok(())
+}
+
+/// Argumen `k=v` menjadi metadata. Nilai boleh memuat '=' (dipisah pada '=' pertama).
+fn baca_metadata(argumen: &[&str]) -> Result<Metadata> {
+    let mut m = Metadata::new();
+    for a in argumen {
+        let Some((k, v)) = a.split_once('=') else { bail!("metadata harus berbentuk nama=nilai (dapat: '{a}')") };
+        m.insert(k.to_string(), v.to_string());
+    }
+    Ok(m)
+}
+
+fn tampil_metadata(m: &Metadata) -> String {
+    if m.is_empty() { "-".into() } else { m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ") }
 }
 
 fn perintah_stats(cfg: &Config, flags: &[&str]) -> Result<()> {

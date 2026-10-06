@@ -69,15 +69,36 @@ class KlienAdmin:
     def keys(self) -> list:
         return self._panggil("GET", "/admin/keys")["keys"]
 
-    def buat_key(self, name: str, rpm: Optional[int] = None, tpm: Optional[int] = None) -> dict:
-        return self._panggil("POST", "/admin/keys", {"name": name, "rpm": rpm, "tpm": tpm})
+    def buat_key(self, name: str, rpm: Optional[int] = None, tpm: Optional[int] = None, metadata: Optional[dict] = None) -> dict:
+        body = {"name": name, "rpm": rpm, "tpm": tpm}
+        if metadata:
+            body["metadata"] = metadata
+        return self._panggil("POST", "/admin/keys", body)
 
-    def ubah_key(self, name: str, active: Any = TIDAK_DIKIRIM, rpm: Any = TIDAK_DIKIRIM, tpm: Any = TIDAK_DIKIRIM) -> dict:
-        body = {k: v for k, v in (("active", active), ("rpm", rpm), ("tpm", tpm)) if v is not TIDAK_DIKIRIM}
+    def ubah_key(
+        self, name: str, active: Any = TIDAK_DIKIRIM, rpm: Any = TIDAK_DIKIRIM, tpm: Any = TIDAK_DIKIRIM, metadata: Any = TIDAK_DIKIRIM,
+        user_rpm: Any = TIDAK_DIKIRIM, user_tpm: Any = TIDAK_DIKIRIM, user_required: Any = TIDAK_DIKIRIM,
+    ) -> dict:
+        """metadata: dict mengganti seluruh isi, None mengosongkan, TIDAK_DIKIRIM membiarkan. user_rpm/user_tpm: batas
+        bawaan per client (None = tanpa batas per client)."""
+        pasangan = (("active", active), ("rpm", rpm), ("tpm", tpm), ("metadata", metadata),
+                    ("user_rpm", user_rpm), ("user_tpm", user_tpm), ("user_required", user_required))
+        body = {k: v for k, v in pasangan if v is not TIDAK_DIKIRIM}
         return self._panggil("PATCH", "/admin/keys/" + urllib.parse.quote(name, safe=""), body)
 
     def hapus_key(self, name: str) -> dict:
         return self._panggil("DELETE", "/admin/keys/" + urllib.parse.quote(name, safe=""))
+
+    # ---- client (label `user` request) di bawah key ----
+    def clients(self, name: str) -> dict:
+        return self._panggil("GET", "/admin/keys/" + urllib.parse.quote(name, safe="") + "/users")
+
+    def simpan_client(self, name: str, user: str, rpm: Optional[int] = None, tpm: Optional[int] = None, active: bool = True) -> dict:
+        jalur = "/admin/keys/" + urllib.parse.quote(name, safe="") + "/users/" + urllib.parse.quote(user, safe="")
+        return self._panggil("PUT", jalur, {"rpm": rpm, "tpm": tpm, "active": active})
+
+    def hapus_client(self, name: str, user: str) -> dict:
+        return self._panggil("DELETE", "/admin/keys/" + urllib.parse.quote(name, safe="") + "/users/" + urllib.parse.quote(user, safe=""))
 
     def upstreams(self) -> list:
         return self._panggil("GET", "/admin/upstreams")["upstreams"]

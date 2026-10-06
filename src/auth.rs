@@ -5,7 +5,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::{error::ApiError, proxy::AppState};
+use std::sync::Arc;
+
+use crate::{error::ApiError, keys::KeyInfo, proxy::AppState};
 
 /// Identitas pemanggil yang sudah lolos autentikasi; disisipkan ke request untuk handler berikutnya.
 #[derive(Debug, Clone)]
@@ -15,11 +17,13 @@ pub struct Identitas {
     /// Batas efektif: batas key sendiri, atau default dari config.
     pub rpm: Option<u64>,
     pub tpm: Option<u64>,
+    /// Data key dari cache (None bila auth dimatikan). Dipakai `/v1/key/info`.
+    pub info: Option<Arc<KeyInfo>>,
 }
 
 impl Identitas {
     fn anonim() -> Self {
-        Self { key_id: 0, nama: "anonim".into(), rpm: None, tpm: None }
+        Self { key_id: 0, nama: "anonim".into(), rpm: None, tpm: None, info: None }
     }
 }
 
@@ -54,6 +58,6 @@ pub async fn autentikasi(State(s): State<AppState>, mut req: Request, next: Next
     };
 
     let (rpm, tpm) = (info.rpm.or(rt.config.default_rpm), info.tpm.or(rt.config.default_tpm));
-    req.extensions_mut().insert(Identitas { key_id: info.id, nama: info.name.clone(), rpm, tpm });
+    req.extensions_mut().insert(Identitas { key_id: info.id, nama: info.name.clone(), rpm, tpm, info: Some(info) });
     next.run(req).await
 }

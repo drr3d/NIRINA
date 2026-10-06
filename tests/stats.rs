@@ -53,6 +53,7 @@ fn rekaman(key: &str, alias: Option<&str>, status: u16, latensi: u64, masuk: Opt
         key_name: key.into(),
         alias: alias.map(String::from),
         upstream: alias.map(|_| "utama".to_string()),
+        end_user: None,
         status,
         hasil: klasifikasi(status, None),
         kode_galat: None,

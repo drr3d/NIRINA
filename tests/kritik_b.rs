@@ -190,6 +190,7 @@ fn rekaman_setelah_jeda_idle_tetap_ditulis_berkala() {
         key_name: "a".into(),
         alias: None,
         upstream: None,
+        end_user: None,
         status: 200,
         hasil: "ok",
         kode_galat: None,

@@ -161,28 +161,65 @@ def tab_ringkasan(c: klien.KlienAdmin, jam: int, label: str):
                          color=["#2e9e6b", "#8b5cf6"], height=200)
 
     st.markdown("##### Rincian")
-    for nama, per in (("Per key", "key"), ("Per model (alias)", "alias"), ("Per upstream", "upstream")):
+    for nama, per in (("Per key", "key"), ("Per client (key/user)", "user"), ("Per model (alias)", "alias"), ("Per upstream", "upstream")):
         with st.expander(nama, expanded=(per == "key")):
             tabel_stats(c.stats(jam, per)["baris"])
 
 
 # ---------- tab: key & limit ----------
 
+BANTUAN_METADATA = (
+    "Satu baris per label, format nama=nilai, mis. client_id=mall-a. Gateway tidak menafsirkannya; aplikasi di depan gateway "
+    "(mis. API NIRINA) membacanya lewat GET /v1/key/info untuk mengetahui milik siapa key ini."
+)
+
+
+def baca_metadata(teks: str) -> dict:
+    """Teks 'nama=nilai' per baris menjadi dict. Baris kosong diabaikan; validasi lengkap dilakukan gateway."""
+    hasil = {}
+    for no, baris in enumerate((teks or "").splitlines(), 1):
+        baris = baris.strip()
+        if not baris:
+            continue
+        nama, sep, nilai = baris.partition("=")
+        if not sep or not nama.strip():
+            raise ValueError(f"Metadata baris {no} harus berbentuk nama=nilai.")
+        hasil[nama.strip()] = nilai.strip()
+    return hasil
+
+
+def tulis_metadata(m: dict) -> str:
+    return "\n".join(f"{k}={v}" for k, v in (m or {}).items())
+
+
 def _cb_buat():
     nama = st.session_state.get("baru_nama", "").strip()
     rpm = None if st.session_state.get("baru_rpm_ikut", True) else int(st.session_state["baru_rpm"])
     tpm = None if st.session_state.get("baru_tpm_ikut", True) else int(st.session_state["baru_tpm"])
-    hasil = jalankan_aksi(lambda: klien_admin().buat_key(nama, rpm, tpm), f"Key '{nama}' dibuat.")
+    try:
+        meta = baca_metadata(st.session_state.get("baru_meta", ""))
+    except ValueError as e:
+        notif("error", str(e))
+        return
+    hasil = jalankan_aksi(lambda: klien_admin().buat_key(nama, rpm, tpm, meta), f"Key '{nama}' dibuat.")
     if hasil:
         st.session_state["key_baru"] = (nama, hasil["key"])
         st.session_state["baru_nama"] = ""
+        st.session_state["baru_meta"] = ""
 
 
 def _cb_simpan(nama: str):
     rpm = None if st.session_state[f"rpm_ikut_{nama}"] else int(st.session_state[f"rpm_{nama}"])
     tpm = None if st.session_state[f"tpm_ikut_{nama}"] else int(st.session_state[f"tpm_{nama}"])
     aktif = bool(st.session_state[f"aktif_{nama}"])
-    jalankan_aksi(lambda: klien_admin().ubah_key(nama, active=aktif, rpm=rpm, tpm=tpm), f"Perubahan pada '{nama}' disimpan.")
+    try:
+        meta = baca_metadata(st.session_state.get(f"meta_{nama}", "")) or None
+    except ValueError as e:
+        notif("error", str(e))
+        return
+    jalankan_aksi(
+        lambda: klien_admin().ubah_key(nama, active=aktif, rpm=rpm, tpm=tpm, metadata=meta), f"Perubahan pada '{nama}' disimpan."
+    )
 
 
 def _cb_hapus(nama: str):
@@ -213,6 +250,7 @@ def tab_key(c: klien.KlienAdmin, cfg_limit: dict):
             "RPM": angka(k["rpm_efektif"]) if k["rpm_efektif"] is not None else "tanpa batas",
             "TPM": angka(k["tpm_efektif"]) if k["tpm_efektif"] is not None else "tanpa batas",
             "Batas sendiri": "ya" if (k["rpm"] is not None or k["tpm"] is not None) else "ikut default",
+            "Metadata": ", ".join(f"{a}={b}" for a, b in (k.get("metadata") or {}).items()) or "-",
             "Dibuat": datetime.fromtimestamp(k["created_at"]).strftime("%Y-%m-%d %H:%M"),
         } for k in keys])
         st.dataframe(df, width="stretch", hide_index=True)
@@ -229,6 +267,7 @@ def tab_key(c: klien.KlienAdmin, cfg_limit: dict):
         st.number_input("Request per menit (RPM)", min_value=1, value=60, step=1, key="baru_rpm", disabled=st.session_state.get("baru_rpm_ikut", True))
         st.checkbox("TPM ikut default", value=True, key="baru_tpm_ikut")
         st.number_input("Token per menit (TPM)", min_value=1, value=100000, step=1000, key="baru_tpm", disabled=st.session_state.get("baru_tpm_ikut", True))
+        st.text_area("Metadata (opsional)", key="baru_meta", placeholder="client_id=mall-a", height=80, help=BANTUAN_METADATA)
         st.button("Buat key", type="primary", on_click=_cb_buat)
 
     with kanan:
@@ -243,11 +282,99 @@ def tab_key(c: klien.KlienAdmin, cfg_limit: dict):
         st.number_input("RPM", min_value=1, value=int(k["rpm"] or 60), step=1, key=f"rpm_{nama}", disabled=st.session_state.get(f"rpm_ikut_{nama}", k["rpm"] is None))
         st.checkbox("TPM ikut default", value=k["tpm"] is None, key=f"tpm_ikut_{nama}")
         st.number_input("TPM", min_value=1, value=int(k["tpm"] or 100000), step=1000, key=f"tpm_{nama}", disabled=st.session_state.get(f"tpm_ikut_{nama}", k["tpm"] is None))
+        st.text_area("Metadata", value=tulis_metadata(k.get("metadata")), key=f"meta_{nama}", height=80, help=BANTUAN_METADATA + " Kosongkan untuk menghapus.")
         st.button("Simpan perubahan", on_click=_cb_simpan, args=(nama,))
         with st.expander("Hapus permanen"):
             st.caption("Menghapus key dari gateway. Riwayat statistik tetap ada. Untuk sekadar menonaktifkan, matikan 'Aktif' di atas.")
             st.checkbox(f"Ya, hapus '{nama}'", key=f"yakin_{nama}")
             st.button("Hapus key", on_click=_cb_hapus, args=(nama,))
+
+    st.divider()
+    bagian_client(c, k)
+
+
+# ---------- client (label `user`) di bawah key ----------
+
+BANTUAN_CLIENT = (
+    "Aplikasi yang melayani banyak client lewat satu key (mis. API NIRINA) mengirim label client di field standar OpenAI "
+    "`user`. Gateway membatasi dan mencatat pemakaian per label itu, di bawah batas key, dan tidak meneruskannya ke provider."
+)
+
+
+def _batas_dari(prefiks: str):
+    return None if st.session_state.get(f"{prefiks}_bebas", True) else int(st.session_state[prefiks])
+
+
+def _cb_aturan_client(nama: str):
+    rpm, tpm = _batas_dari(f"crpm_{nama}"), _batas_dari(f"ctpm_{nama}")
+    wajib = bool(st.session_state.get(f"cwajib_{nama}", False))
+    jalankan_aksi(lambda: klien_admin().ubah_key(nama, user_rpm=rpm, user_tpm=tpm, user_required=wajib),
+                  f"Aturan client untuk '{nama}' disimpan.")
+
+
+def _cb_simpan_client(nama: str):
+    user = (st.session_state.get(f"cuser_{nama}") or "").strip()
+    if not user:
+        notif("error", "Isi label client dulu (nilai field user yang dikirim aplikasi).")
+        return
+    rpm = None if st.session_state.get(f"cu_rpm_ikut_{nama}", True) else int(st.session_state[f"cu_rpm_{nama}"])
+    tpm = None if st.session_state.get(f"cu_tpm_ikut_{nama}", True) else int(st.session_state[f"cu_tpm_{nama}"])
+    aktif = bool(st.session_state.get(f"cu_aktif_{nama}", True))
+    if jalankan_aksi(lambda: klien_admin().simpan_client(nama, user, rpm, tpm, aktif), f"Client '{user}' disimpan."):
+        st.session_state[f"cuser_{nama}"] = ""
+
+
+def _cb_hapus_client(nama: str):
+    user = st.session_state.get(f"chapus_{nama}")
+    if user:
+        jalankan_aksi(lambda: klien_admin().hapus_client(nama, user), f"Pengaturan khusus client '{user}' dihapus.")
+
+
+def _input_batas(label: str, prefiks: str, nilai, bawaan: int, langkah: int, teks_bebas: str):
+    st.checkbox(teks_bebas, value=nilai is None, key=f"{prefiks}_bebas")
+    st.number_input(label, min_value=1, value=int(nilai or bawaan), step=langkah, key=prefiks,
+                    disabled=st.session_state.get(f"{prefiks}_bebas", nilai is None))
+
+
+def bagian_client(c: klien.KlienAdmin, k: dict):
+    nama = k["name"]
+    st.markdown(f"##### Client di bawah key '{nama}'", help=BANTUAN_CLIENT)
+    data = c.clients(nama)
+    kiri, kanan = st.columns(2)
+    with kiri:
+        st.caption("Aturan untuk semua client key ini")
+        st.checkbox("Wajib kirim label client (user)", value=bool(k.get("user_required")), key=f"cwajib_{nama}",
+                    help="Request tanpa field user ditolak 400 user_required, supaya semua pemakaian teratribusi ke client.")
+        _input_batas("RPM per client", f"crpm_{nama}", k.get("user_rpm"), 30, 1, "RPM per client: tanpa batas")
+        _input_batas("TPM per client", f"ctpm_{nama}", k.get("user_tpm"), 50000, 1000, "TPM per client: tanpa batas")
+        st.button("Simpan aturan client", on_click=_cb_aturan_client, args=(nama,))
+    with kanan:
+        st.caption("Pengaturan khusus satu client (mengalahkan aturan di kiri)")
+        st.text_input("Label client", key=f"cuser_{nama}", placeholder="mis. mall-a",
+                      help="Persis nilai field user dari aplikasi. Huruf, angka, _ - . : @ (maks. 64).")
+        st.checkbox("RPM ikut aturan key", value=True, key=f"cu_rpm_ikut_{nama}")
+        st.number_input("RPM client", min_value=1, value=30, step=1, key=f"cu_rpm_{nama}",
+                        disabled=st.session_state.get(f"cu_rpm_ikut_{nama}", True))
+        st.checkbox("TPM ikut aturan key", value=True, key=f"cu_tpm_ikut_{nama}")
+        st.number_input("TPM client", min_value=1, value=50000, step=1000, key=f"cu_tpm_{nama}",
+                        disabled=st.session_state.get(f"cu_tpm_ikut_{nama}", True))
+        st.toggle("Aktif", value=True, key=f"cu_aktif_{nama}", help="Matikan untuk memblokir client ini (403 user_blocked).")
+        st.button("Simpan client", on_click=_cb_simpan_client, args=(nama,))
+
+    daftar = data.get("users") or []
+    if daftar:
+        st.dataframe(pd.DataFrame([{
+            "Client": u["user"], "Status": "Aktif" if u["active"] else "Diblokir",
+            "RPM": angka(u["rpm_efektif"]) if u["rpm_efektif"] is not None else "tanpa batas",
+            "TPM": angka(u["tpm_efektif"]) if u["tpm_efektif"] is not None else "tanpa batas",
+            "Batas sendiri": "ya" if (u["rpm"] is not None or u["tpm"] is not None) else "ikut aturan key",
+        } for u in daftar]), width="stretch", hide_index=True)
+        with st.expander("Hapus pengaturan khusus client"):
+            st.selectbox("Client", [u["user"] for u in daftar], key=f"chapus_{nama}")
+            st.caption("Client kembali memakai aturan key. Riwayat statistik tetap ada.")
+            st.button("Hapus pengaturan client", on_click=_cb_hapus_client, args=(nama,))
+    else:
+        st.caption("Belum ada client dengan pengaturan khusus. Client lain tetap dibatasi aturan di kiri dan tercatat di Ringkasan > Per client.")
 
 
 # ---------- tab: upstream ----------

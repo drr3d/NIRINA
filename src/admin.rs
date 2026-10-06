@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
 };
 use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     config::Config,
     error::ApiError,
-    keys::{KeyInfo, NamaDipakai, validasi_nama},
+    keys::{Client, KeyInfo, Metadata, NamaDipakai, validasi_metadata, validasi_nama, validasi_user},
     proxy::AppState,
     stats::{Kelompok, sekarang_ms},
     util::PembatasLog,
@@ -38,6 +38,8 @@ pub fn admin_app(state: AppState) -> Router {
         .route("/admin/reload", post(muat_ulang))
         .route("/admin/keys", get(daftar_key).post(buat_key))
         .route("/admin/keys/{nama}", patch(ubah_key).delete(hapus_key))
+        .route("/admin/keys/{nama}/users", get(daftar_client))
+        .route("/admin/keys/{nama}/users/{user}", put(simpan_client).delete(hapus_client))
         .route("/admin/upstreams", get(status_upstream))
         .route("/admin/stats", get(statistik))
         .route("/admin/guardrail/events", get(kejadian_guardrail))
@@ -131,7 +133,8 @@ fn url_aman(url: &str) -> String {
 fn key_json(k: &KeyInfo, cfg: &Config) -> Value {
     json!({
         "id": k.id, "name": k.name, "prefix": k.prefix, "active": k.active, "created_at": k.created_at,
-        "rpm": k.rpm, "tpm": k.tpm,
+        "rpm": k.rpm, "tpm": k.tpm, "metadata": k.metadata,
+        "user_rpm": k.user_rpm, "user_tpm": k.user_tpm, "user_required": k.user_required,
         "rpm_efektif": k.rpm.or(cfg.default_rpm), "tpm_efektif": k.tpm.or(cfg.default_tpm),
     })
 }
@@ -175,10 +178,38 @@ struct BuatKey {
     name: String,
     rpm: Option<u64>,
     tpm: Option<u64>,
+    metadata: Option<Value>,
+    /// Batas bawaan per client (field `user`) dan kewajiban mengirim `user`.
+    user_rpm: Option<u64>,
+    user_tpm: Option<u64>,
+    user_required: Option<bool>,
+}
+
+/// Metadata dari body JSON: objek berisi teks. null/tidak ada = kosong. Diterima sebagai `Value` (bukan langsung peta teks)
+/// supaya galatnya spesifik (`invalid_metadata`), bukan galat parse body umum.
+fn metadata_dari(v: Option<Value>) -> Result<Metadata, ApiError> {
+    let tolak = |p: String| galat(StatusCode::BAD_REQUEST, "invalid_metadata", p);
+    let m: Metadata = match v {
+        None | Some(Value::Null) => Metadata::new(),
+        Some(Value::Object(o)) => o
+            .into_iter()
+            .map(|(k, v)| match v {
+                Value::String(t) => Ok((k, t)),
+                _ => Err(tolak(format!("Nilai metadata '{k}' harus teks."))),
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err(tolak("Metadata harus objek JSON berisi teks, mis. {\"client_id\": \"mall-a\"}.".into())),
+    };
+    validasi_metadata(&m).map_err(|e| tolak(format!("Metadata tidak valid: {e}.")))?;
+    Ok(m)
 }
 
 fn validasi_batas(rpm: Option<u64>, tpm: Option<u64>) -> Result<(), ApiError> {
-    for (label, v) in [("rpm", rpm), ("tpm", tpm)] {
+    cek_batas(&[("rpm", rpm), ("tpm", tpm)])
+}
+
+fn cek_batas(daftar: &[(&str, Option<u64>)]) -> Result<(), ApiError> {
+    for &(label, v) in daftar {
         if v.is_some_and(|x| x == 0 || x > i64::MAX as u64) {
             return Err(galat(StatusCode::BAD_REQUEST, "invalid_limit", format!("{label} harus >= 1 (atau null untuk tanpa batas).")));
         }
@@ -190,17 +221,23 @@ async fn buat_key(State(s): State<AppState>, body: Bytes) -> Result<(StatusCode,
     let b: BuatKey = baca_body(&body)?;
     validasi_nama(&b.name).map_err(|e| galat(StatusCode::BAD_REQUEST, "invalid_name", e.to_string()))?;
     validasi_batas(b.rpm, b.tpm)?;
+    cek_batas(&[("user_rpm", b.user_rpm), ("user_tpm", b.user_tpm)])?;
+    let metadata = metadata_dari(b.metadata)?;
+    let aturan_client = (b.user_rpm, b.user_tpm, b.user_required.unwrap_or(false));
 
     let (keys, nama, rpm, tpm) = (Arc::clone(&s.keys), b.name.clone(), b.rpm, b.tpm);
     let dibuat = blok(move || match keys.create(&nama) {
         Ok((info, token)) => {
-            let info = if rpm.is_some() || tpm.is_some() {
+            if rpm.is_some() || tpm.is_some() {
                 keys.set_limits(&nama, rpm, tpm)?;
-                keys.get(&nama)?.unwrap_or(info)
-            } else {
-                info
-            };
-            Ok(Some((info, token)))
+            }
+            if !metadata.is_empty() {
+                keys.set_metadata(&nama, &metadata)?;
+            }
+            if aturan_client != (None, None, false) {
+                keys.set_aturan_client(&nama, aturan_client.0, aturan_client.1, aturan_client.2)?;
+            }
+            Ok(Some((keys.get(&nama)?.unwrap_or(info), token)))
         }
         Err(e) if e.downcast_ref::<NamaDipakai>().is_some() => Ok(None),
         Err(e) => Err(e),
@@ -214,9 +251,9 @@ async fn buat_key(State(s): State<AppState>, body: Bytes) -> Result<(StatusCode,
     Ok((StatusCode::CREATED, Json(json!({ "key": token, "info": key_json(&info, &s.runtime().config) }))))
 }
 
-/// Membedakan field yang tidak dikirim (biarkan) dari yang dikirim null (hapus batas).
-fn ganda<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<u64>>, D::Error> {
-    Ok(Some(Option::<u64>::deserialize(d)?))
+/// Membedakan field yang tidak dikirim (biarkan) dari yang dikirim null (hapus batas/metadata).
+fn ganda<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
+    Ok(Some(Option::<T>::deserialize(d)?))
 }
 
 #[derive(Deserialize)]
@@ -227,21 +264,47 @@ struct UbahKey {
     rpm: Option<Option<u64>>,
     #[serde(default, deserialize_with = "ganda")]
     tpm: Option<Option<u64>>,
+    /// Mengganti seluruh metadata; null = kosongkan.
+    #[serde(default, deserialize_with = "ganda")]
+    metadata: Option<Option<Value>>,
+    #[serde(default, deserialize_with = "ganda")]
+    user_rpm: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "ganda")]
+    user_tpm: Option<Option<u64>>,
+    user_required: Option<bool>,
 }
 
 async fn ubah_key(State(s): State<AppState>, Path(nama): Path<String>, body: Bytes) -> Hasil {
     let p: UbahKey = baca_body(&body)?;
-    if p.active.is_none() && p.rpm.is_none() && p.tpm.is_none() {
-        return Err(galat(StatusCode::BAD_REQUEST, "no_changes", "Tidak ada perubahan: kirim active, rpm, atau tpm."));
+    let ubah_client = p.user_rpm.is_some() || p.user_tpm.is_some() || p.user_required.is_some();
+    if p.active.is_none() && p.rpm.is_none() && p.tpm.is_none() && p.metadata.is_none() && !ubah_client {
+        return Err(galat(
+            StatusCode::BAD_REQUEST,
+            "no_changes",
+            "Tidak ada perubahan: kirim active, rpm, tpm, metadata, user_rpm, user_tpm, atau user_required.",
+        ));
     }
     // Hanya nilai yang dikirim yang perlu divalidasi; nilai lama di database sudah valid.
     validasi_batas(p.rpm.flatten(), p.tpm.flatten())?;
+    cek_batas(&[("user_rpm", p.user_rpm.flatten()), ("user_tpm", p.user_tpm.flatten())])?;
+    let metadata = p.metadata.map(metadata_dari).transpose()?;
 
     let (keys, nama2) = (Arc::clone(&s.keys), nama.clone());
     let baru = blok(move || {
         let Some(lama) = keys.get(&nama2)? else { return Ok(None) };
         if p.rpm.is_some() || p.tpm.is_some() {
             keys.set_limits(&nama2, p.rpm.unwrap_or(lama.rpm), p.tpm.unwrap_or(lama.tpm))?;
+        }
+        if let Some(m) = &metadata {
+            keys.set_metadata(&nama2, m)?;
+        }
+        if ubah_client {
+            keys.set_aturan_client(
+                &nama2,
+                p.user_rpm.unwrap_or(lama.user_rpm),
+                p.user_tpm.unwrap_or(lama.user_tpm),
+                p.user_required.unwrap_or(lama.user_required),
+            )?;
         }
         if let Some(a) = p.active {
             keys.set_active(&nama2, a)?;
@@ -259,6 +322,66 @@ async fn hapus_key(State(s): State<AppState>, Path(nama): Path<String>) -> Hasil
         return Err(galat(StatusCode::NOT_FOUND, "key_not_found", format!("Key '{nama}' tidak ditemukan.")));
     }
     Ok(Json(json!({ "dihapus": nama })))
+}
+
+// ---------- client (label `user`) di bawah key ----------
+
+fn client_json(c: &Client, k: &KeyInfo) -> Value {
+    json!({
+        "user": c.user, "rpm": c.rpm, "tpm": c.tpm, "active": c.active, "created_at": c.created_at,
+        "rpm_efektif": c.rpm.or(k.user_rpm), "tpm_efektif": c.tpm.or(k.user_tpm),
+    })
+}
+
+fn key_tidak_ada(nama: &str) -> ApiError {
+    galat(StatusCode::NOT_FOUND, "key_not_found", format!("Key '{nama}' tidak ditemukan."))
+}
+
+async fn daftar_client(State(s): State<AppState>, Path(nama): Path<String>) -> Hasil {
+    let (keys, nama2) = (Arc::clone(&s.keys), nama.clone());
+    let hasil = blok(move || Ok(keys.get(&nama2)?.zip(keys.list_clients(&nama2)?))).await?;
+    let (k, daftar) = hasil.ok_or_else(|| key_tidak_ada(&nama))?;
+    Ok(Json(json!({
+        "key": k.name,
+        "user_rpm": k.user_rpm, "user_tpm": k.user_tpm, "user_required": k.user_required,
+        "users": daftar.iter().map(|c| client_json(c, &k)).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SimpanClient {
+    /// null/tidak ada = ikut batas bawaan per client dari key.
+    rpm: Option<u64>,
+    tpm: Option<u64>,
+    /// false = blokir client. Bawaan true.
+    active: Option<bool>,
+}
+
+/// Membuat atau mengganti seluruh pengaturan khusus satu client.
+async fn simpan_client(State(s): State<AppState>, Path((nama, user)): Path<(String, String)>, body: Bytes) -> Hasil {
+    let b: SimpanClient = if body.is_empty() { SimpanClient { rpm: None, tpm: None, active: None } } else { baca_body(&body)? };
+    validasi_user(&user).map_err(|e| galat(StatusCode::BAD_REQUEST, "invalid_user", format!("{e}.")))?;
+    validasi_batas(b.rpm, b.tpm)?;
+    let (keys, nama2) = (Arc::clone(&s.keys), nama.clone());
+    let hasil = blok(move || {
+        let Some(c) = keys.set_client(&nama2, &user, b.rpm, b.tpm, b.active.unwrap_or(true))? else { return Ok(None) };
+        Ok(keys.get(&nama2)?.map(|k| (c, k)))
+    })
+    .await?;
+    let (c, k) = hasil.ok_or_else(|| key_tidak_ada(&nama))?;
+    Ok(Json(json!({ "user": client_json(&c, &k) })))
+}
+
+async fn hapus_client(State(s): State<AppState>, Path((nama, user)): Path<(String, String)>) -> Hasil {
+    let (keys, nama2, user2) = (Arc::clone(&s.keys), nama.clone(), user.clone());
+    match blok(move || keys.remove_client(&nama2, &user2)).await? {
+        None => Err(key_tidak_ada(&nama)),
+        Some(false) => {
+            Err(galat(StatusCode::NOT_FOUND, "user_not_found", format!("Client '{user}' tidak punya pengaturan khusus di key '{nama}'.")))
+        }
+        Some(true) => Ok(Json(json!({ "dihapus": user }))),
+    }
 }
 
 async fn status_upstream(State(s): State<AppState>) -> Json<Value> {

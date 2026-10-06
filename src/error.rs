@@ -14,11 +14,13 @@ pub struct ApiError {
     pub message: String,
     /// Diisi untuk 429: dikirim sebagai header Retry-After (detik).
     pub retry_after: Option<u64>,
+    /// Field `param` format error OpenAI: parameter request yang menyebabkan galat (mis. "user" untuk batas client).
+    pub param: Option<&'static str>,
 }
 
 impl ApiError {
     pub fn new(status: StatusCode, kind: &'static str, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, kind, code, message: message.into(), retry_after: None }
+        Self { status, kind, code, message: message.into(), retry_after: None, param: None }
     }
 
     /// `respons` = true bila yang ditahan adalah jawaban dari upstream (bukan request klien).
@@ -52,6 +54,20 @@ impl ApiError {
         e
     }
 
+    /// 429 karena batas client (label `user`) terlampaui; batas key sendiri masih tersisa. `param` = "user" supaya aplikasi
+    /// bisa membedakannya dari batas key.
+    pub fn rate_limited_client(tolak: crate::limiter::Tolak, user: &str) -> Self {
+        let mut e = Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "rate_limit_exceeded",
+            format!("Batas {} untuk client '{user}' terlampaui. Coba lagi dalam {} detik.", tolak.nama(), tolak.retry_after_detik()),
+        );
+        e.retry_after = Some(tolak.retry_after_detik());
+        e.param = Some("user");
+        e
+    }
+
     pub fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request_error", code, message)
     }
@@ -59,7 +75,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = json!({ "error": { "message": self.message, "type": self.kind, "code": self.code } });
+        let body = json!({ "error": { "message": self.message, "type": self.kind, "code": self.code, "param": self.param } });
         let mut resp = (self.status, Json(body)).into_response();
         resp.extensions_mut().insert(crate::stats::KodeGalat(self.code));
         if let Some(d) = self.retry_after {
